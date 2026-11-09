@@ -28,6 +28,13 @@ const ID_OF = Object.fromEntries(JOINT_NAMES.map((n, i) => [n, IDS[i]]));
 const NAME_OF = Object.fromEntries(IDS.map((id, i) => [id, JOINT_NAMES[i]]));
 const GROUP_OF = (id) => (id >= 30 ? 'H' : id >= 20 ? 'L' : 'R');
 const SEL_COLOR = { R: '#E5484D', L: '#2F7CF6', H: '#F5B400' };
+const REF_COLOR = { R: '#F4A7A9', L: '#9DBEF9', H: '#FADA80' };    // 参照舵机：同组颜色淡一档
+// 对准时拿来比的参照舵机（按关节，左右腿一样；对应 ZERO_REF 的文字）
+const REF_SERVOS = { hip_yaw: ['hip_roll'], hip_roll: ['knee'], hip_pitch: ['knee', 'hip_roll'], knee: ['ankle'], neck_pitch: ['head_pitch'] };
+const refServos = (name) => {
+  const m = /^(left_|right_)?(.*)$/.exec(name || '');
+  return (REF_SERVOS[m[2]] || []).map((r) => (m[1] || '') + r);
+};
 const GROUPS = [['L', '左腿', '20–24'], ['R', '右腿', '10–14'], ['H', '头颈', '30–34']];
 const DANGER = { 5: 'ID：改了会撞号，总线上只能接这一颗再改', 6: '波特率：改了就失联', 8: '应答级别：改成 0 写指令就不回包',
   9: '最小角度限制', 11: '最大角度限制', 19: '卸载条件（保护开关）：关掉过热过流就不自动卸', 33: '运行模式：改成速度模式舵机会一直转' };
@@ -66,12 +73,18 @@ function ServoStage({ sv, pose, setPose, selected, onSelect }) {
   const boxRef = useRef(null), canvasRef = useRef(null), duckRef = useRef(null);
   const [ready, setReady] = useState(false);
   const [moved, setMoved] = useState(false);
+  // 视角：自由（一个能拖着转的透视视角）/ 三视图（正面、侧面、俯视三格正交 + 自由；11-09），记在本机
+  const [layout, setLayoutState] = useState(() => (localStorage.getItem('studio.servo.layout') === 'quad' ? 'quad' : 'single'));
+  const setLayout = (k) => { setLayoutState(k); try { localStorage.setItem('studio.servo.layout', k); } catch { /* 隐私模式 */ } };
+  const side = selected && GROUP_OF(selected) === 'R' ? 'right' : 'left';
 
   useEffect(() => {
     const d = new Duck3D(canvasRef.current, { view: 'front', centerX: 0.5, centerY: 0.52, fill: 0.82 });
     duckRef.current = d;
     d.onUserMove = () => setMoved(true);
     d.onPick = (name) => ID_OF[name] && onSelect(ID_OF[name]);
+    d.setLayout(layout);
+    d.setSide(side);
     d.load('model/').then(() => setReady(true)).catch(() => {});
     return () => d.dispose();
   }, []);
@@ -93,12 +106,16 @@ function ServoStage({ sv, pose, setPose, selected, onSelect }) {
   useEffect(() => {
     if (!ready) return;
     duckRef.current.select(selected ? NAME_OF[selected] : null, selected ? SEL_COLOR[GROUP_OF(selected)] : null);
+    duckRef.current.setRefs(selected ? refServos(NAME_OF[selected]) : [], selected ? REF_COLOR[GROUP_OF(selected)] : null);
   }, [selected, ready]);
 
+  useEffect(() => { duckRef.current?.setLayout(layout); }, [layout]);
+  useEffect(() => { duckRef.current?.setSide(side); }, [side]);
+
   useEffect(() => {
-    if (!ready || pose !== 'zero') return undefined;
+    if (!ready || pose !== 'zero' || layout === 'quad') return undefined;     // 舵机号标签按自由视角的相机算，三视图里不画
     return drawServoLabels(duckRef.current, boxRef.current);
-  }, [ready, pose]);
+  }, [ready, pose, layout]);
 
   return html`<div class="sv-stage" ref=${boxRef}>
     <canvas ref=${canvasRef} style=${{ visibility: pose === 'live' && sv?.diagnostic ? 'hidden' : 'visible' }}></canvas>
@@ -106,8 +123,17 @@ function ServoStage({ sv, pose, setPose, selected, onSelect }) {
       ${[['live', '实时'], ...Object.entries(POSES).map(([k, p]) => [k, p.label])].map(([k, label]) =>
         html`<button role="tab" aria-selected=${pose === k} class=${pose === k ? 'on' : ''} onClick=${(e) => { e.currentTarget.blur(); setPose(k); }}>${label}</button>`)}
     </div>
+    ${layout === 'quad' ? html`<div class="sv-quad" aria-hidden="true">
+      <span class="q1">正面</span><span class="q2">${side === 'right' ? '右侧（看右腿）' : '左侧（看左腿）'}</span>
+      <span class="q3">俯视（只画腿，脸朝下）· 方格 1 cm</span><span class="q4">自由 · 拖动转${pose !== 'live' ? ' · 参考姿势' : ''}</span>
+    </div>` : null}
     ${!ready ? html`<span class="sv-loading">3D 模型加载中…</span>` : null}
-    <span class="sv-note">${pose !== 'live' ? '参考姿势 · 不是鸭子现在的样子' : sv?.diagnostic ? '启动诊断只有原始反馈，暂不显示标定姿态' : '拖动转视角 · 点舵机选中'}</span>
+    ${layout === 'quad' ? null : html`<span class="sv-note">${pose !== 'live' ? '参考姿势 · 不是鸭子现在的样子' : sv?.diagnostic ? '启动诊断只有原始反馈，暂不显示标定姿态' : '拖动转视角 · 点舵机选中'}</span>`}
+    <div class="sv-poses sv-layout" role="tablist" aria-label="视角">
+      ${[['single', '自由'], ['quad', '三视图']].map(([k, label]) =>
+        html`<button role="tab" aria-selected=${layout === k} class=${layout === k ? 'on' : ''} onClick=${(e) => { e.currentTarget.blur(); setLayout(k); }}
+          title=${k === 'quad' ? '正面、侧面、俯视三格正交投影（同一比例、带 1 cm 方格）+ 右下自由视角；选中的舵机和它的参照舵机都会亮' : '一个能拖着转的视角'}>${label}</button>`)}
+    </div>
     ${moved ? html`<button class="reset-view" onClick=${(e) => { e.currentTarget.blur(); duckRef.current?.resetView(); setMoved(false); }}>回正</button>` : null}
   </div>`;
 }

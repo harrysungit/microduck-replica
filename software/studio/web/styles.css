@@ -348,6 +348,17 @@ button:disabled { cursor: default; }
 .sv-closed p { margin: 6px 0; font-size: 15px; line-height: 1.7; }
 .sv-small { color: var(--text-2); font-size: 13px !important; }
 @media (max-width: 1100px) { .sv-grid { grid-template-columns: 1fr; } .sv-stage { height: 520px; } }
+.sv-stage .sv-poses.sv-layout { left: auto; right: 12px; }      /* 比后面的 .sv-stage .sv-poses（left: 12px）高一级 */
+.sv-stage .sv-layout ~ .reset-view { top: 56px; }
+/* 三视图（11-09）：四格中间两条缝、每格左下角一个名字 */
+.sv-quad { position: absolute; inset: 0; pointer-events: none; }
+.sv-quad::before { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: rgba(255,255,255,.6); }
+.sv-quad::after { content: ''; position: absolute; top: 50%; left: 0; right: 0; height: 2px; margin-top: -1px; background: rgba(255,255,255,.6); }
+.sv-quad span { position: absolute; padding: 2px 9px; border-radius: 999px; background: rgba(0,0,0,.35); color: #FFF; font-size: 12px; }
+.sv-quad .q1 { left: 12px; bottom: calc(50% + 10px); }
+.sv-quad .q2 { left: calc(50% + 12px); bottom: calc(50% + 10px); }
+.sv-quad .q3 { left: 12px; bottom: 12px; }
+.sv-quad .q4 { left: calc(50% + 12px); bottom: 12px; }
 .sv-stage .reset-view { position: absolute; z-index: 2; right: 16px; top: 14px; height: 30px; padding: 0 14px; border: 0; border-radius: 999px; background: var(--stage-btn2-bg); color: var(--stage-btn2-fg); font-size: 13px; }
 .sv-table tbody tr { cursor: pointer; }
 .sv-table tbody tr:hover td { background: #F7F7F9; }
