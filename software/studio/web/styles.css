@@ -483,6 +483,15 @@ button:disabled { cursor: default; }
 .btn-ok { height: 32px; padding: 0 14px; border: 0; border-radius: 999px; background: #E3F6EA; color: #1E7B3A; font-weight: 600; font-size: 14px; }
 .btn-ok:disabled { opacity: .45; }
 .sv-calib .sv-form { grid-template-columns: 70px minmax(0, 1fr); }
+/* 零位微调 · 旷量（11-08） */
+.sv-trim .sv-form { grid-template-columns: 70px minmax(0, 1fr); }
+.sv-trim .sv-ref { margin: 0; }
+.sv-big { font-size: 20px; }
+.sv-jog { min-width: 44px; }
+.sv-warn-b { color: var(--warn); font-weight: 600; }
+.sv-plan td.warn { color: var(--warn); font-weight: 600; }
+.sv-playtab { margin-top: 10px; }
+.sv-playtab summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--text-2); }
 /* 窄屏（平板竖着、手机）：上下排。上面 v5 那条写在 1100px 规则后面把它盖掉了，手机上整页能左右滑 */
 @media (max-width: 1100px) {
   .sv-main { grid-template-columns: minmax(0, 1fr); }

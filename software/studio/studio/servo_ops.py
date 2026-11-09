@@ -17,6 +17,13 @@ Studio 改的（用户要求和方案审查）：
 - **上力的软硬跟主程序一样**（用户 10-19）：每条上力的路上，开扭矩之前先把 RAM 里的 P / D / 限力写成主程序上力时的
   （参数文件，没有就 P5 · D0 · 限力 1000），写不进去不上力；见 MainGains、apply_gains；
 - 文件放在 Studio 的 state 目录（servo-calib/、servo-poses/）；模拟模式的校准备份放临时目录，不跟真舵机混。
+
+11-08 加的（零位微调、旷量；zero_* / play_*）：
+- **零位微调**：上力保持时点动（只改目标 42，不写 EEPROM），对准了点「设为零位」：只换算偏移 31、目标跟着挪，
+  关节不动；不关扭矩，所以没有中位校准那种下垂误差。一轮里改过的几颗记在同一份备份上，「撤销上一次」一次撤回整轮；
+- **旷量**：「读数晃动」= 上力时人轻推，编码器看得见的那部分；「总旷量」= 肢体推到两头各对准一次（记 A / B）的差；
+  「取中」把零位设在 A、B 中点；量的结果可以存成表；
+- **偏移方向存盘**（servo-calib/offset-sign.json，按固件版本）：Studio 重启后改零位不用再探。
 """
 import json
 import math
@@ -34,6 +41,13 @@ CALIB_TOLERANCE = 2      # 校准后读数离目标多少步算到位
 DROOP_TOLERANCE = 3      # 关扭矩那几毫秒关节垂了多少步以内就不补偿
 OFFSET_LIMIT = 2047      # 偏移寄存器 31 的安全量程（|偏移| ≤ 2047 几种编码理解都一致，超出不写）
 CALIB_BIG_DEG = 30       # 摆好的位置离目标差这么多度以上：页面再确认一次，日志单独列出来（不拦）
+ZERO_JOG_MAX = 114       # 零位微调、量旷量时点动最多离 2048 多少步（10°）；差得更多就该松力重新摆、重新中位校准
+ZERO_ROUND_MAX = 114     # 一轮零位微调里一颗最多改多少步（10°），理由同上
+ZERO_SET_SETTLE = 8      # 「设为零位」时读数离目标超过这么多步：还在走，或者手还推着，先不设
+SIGN_CHECK = 4           # 改零位写完偏移马上读一次：读数跟预期差这么多步以上就算没写对（偏移方向记反了会差 2 倍改动量）
+WIGGLE_S = 5.0           # 量「读数晃动」默认几秒
+PLAY_WARN_DEG = 2.0      # 旷量标黄：训练里带齿隙的任务按每个关节 ±1°（总间隙 2°）建模，超过的策略没见过
+SIGN_FILE = "offset-sign.json"
 FOLD_KNEE_SEND = 88 * math.pi / 180     # 发「折叠」时膝只折 88°：官方 90° 会让踝顶着大腿上的舵机
 JOINT = {20: "left_hip_yaw", 21: "left_hip_roll", 22: "left_hip_pitch", 23: "left_knee", 24: "left_ankle",
          30: "neck_pitch", 31: "head_pitch", 32: "head_yaw", 33: "head_roll", 34: "mouth",
@@ -65,6 +79,7 @@ GESTURES = [
     (1, lambda s: [({33: 7, 32: 6}, 0.18), ({33: -7, 32: -6}, 0.2), ({33: 0, 32: 0}, 0.25)]),                           # 抖一下
 ]
 CAT = {"运动": "总线", "寄存器": "总线", "方向": "校准", "姿态": "校准"}
+SIM_WIGGLE = {i: 4 + (i * 7) % 11 for i in IDS}   # 演示模式没人推舵机：「读数晃动」给每颗一个固定的假数（步）
 
 
 def enc_sm(v):
@@ -280,6 +295,8 @@ class ServoOps:
         self.gains = MainGains(log=self.log)
         self.manual = {}
         self._gains_logged = None
+        self.zero_round = None           # 零位微调这一轮的备份文件名（_zero_round_file）
+        self.play = {}                   # 旷量：{id: {"a" / "b": {"pos": 读数, "off": 当时的偏移}, "wiggle": 步, "samples": 次, "at": 时间}}
 
     # ---- 小工具 ----
 
@@ -726,21 +743,28 @@ class ServoOps:
 
     # ---- 中位校准 ----
 
+    def _backup_row(self, i):
+        ver = self.bus.read(i, 0, 5)[1]
+        return {"offset": self.bus.read_u16(i, 31), "pos": self.read_pos(i),
+                "torque": self.bus.read_u8(i, 40), "lock": self.bus.read_u8(i, 55),
+                "firmware": f"{ver[0]}.{ver[1]}"}
+
+    @staticmethod
+    def _backup_name():
+        now = time.time()
+        return f"eeprom-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}{int(now * 1000) % 1000:03d}.json"
+
     def backup_calibration(self, ids):
         rows = {}
         for i in ids:
             try:
-                ver = self.bus.read(i, 0, 5)[1]
-                rows[str(i)] = {"offset": self.bus.read_u16(i, 31), "pos": self.read_pos(i),
-                                "torque": self.bus.read_u8(i, 40), "lock": self.bus.read_u8(i, 55),
-                                "firmware": f"{ver[0]}.{ver[1]}"}
+                rows[str(i)] = self._backup_row(i)
             except Exception as e:  # noqa: BLE001
                 rows[str(i)] = {"error": f"{type(e).__name__}: {e}"}
                 self.log(f"#{i} 备份时读不到：{type(e).__name__}: {e}", "校准", "warn")
         d = self.calib_dir()
         os.makedirs(d, exist_ok=True)
-        now = time.time()
-        fn = f"eeprom-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}{int(now * 1000) % 1000:03d}.json"
+        fn = self._backup_name()
         _save_json(os.path.join(d, fn), {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "servos": rows})
         return fn, rows
 
@@ -1059,7 +1083,7 @@ class ServoOps:
             moved = self.shift_saved_poses(rec.get("deltas", {}), sign=-1, only=set(rec["shifted"]) | set(later))
             if moved:
                 self.log(f"存的姿态换算回原来的零点：{moved}", "姿态")
-        if ok and not rec.get("sim"):
+        if ok and not rec.get("sim") and rec.get("kind") != "zero_trim":      # 零位微调前这几颗本来就校过中位，不删
             try:
                 from .commit import forget_centered
                 gone = forget_centered(self.state_dir, ok)
@@ -1068,9 +1092,302 @@ class ServoOps:
             except OSError as e:
                 self.log(f"撤销成功的颗没能从 Studio 的中位记录里删掉：{type(e).__name__}: {e}", "校准", "warn")
         os.rename(os.path.join(d, fn), os.path.join(d, "undone-" + fn))
+        if fn == self.zero_round:
+            self.zero_round = None
         self.log(f"撤销完（{fn} 已改名 undone-{fn}）：{len(ok)} 颗偏移写回" + (f"；失败 {sorted(bad)}" if bad else ""),
                  "校准", "warn" if bad else "info")
         return {"ok": ok, "bad": {str(k): v for k, v in bad.items()}, "backup": fn}
+
+    # ---- 零位微调、旷量（11-08） ----
+
+    def _firmware(self, i):
+        ver = self.bus.read(i, 0, 5)[1]
+        return f"{ver[0]}.{ver[1]}"
+
+    def _remember_sign(self, i, how):
+        """偏移方向（读数 = 原始 ± 偏移）同一种固件不会变：知道了就存盘，Studio 重启以后改零位不用再探。存不进去只记日志。"""
+        try:
+            fw = self._firmware(i)
+            path = os.path.join(self.calib_dir(), SIGN_FILE)
+            old = _load_json(path) if os.path.isfile(path) else {}
+            if old.get("sign") == self.offset_sign and old.get("firmware") == fw:
+                return
+            os.makedirs(self.calib_dir(), exist_ok=True)
+            _save_json(path, {"sign": self.offset_sign, "firmware": fw, "servo": i, "how": how,
+                              "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+            self.log(f"偏移方向存盘：读数 = 原始 {'+' if self.offset_sign > 0 else '−'} 偏移（固件 {fw}，#{i}，{how}）", "校准")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"偏移方向没存进去：{type(e).__name__}: {e}", "校准", "warn")
+
+    def ensure_offset_sign(self, i):
+        """改零位要知道偏移方向：内存里有就用（改的时候还会拿读数核对，见 _shift_zero）；存过盘、固件一样就用存的；
+        都没有就在 yaw 舵机上探一步（32 头、20 / 10 髋：竖轴不受重力，探的那几毫秒关节不会垂，不会把方向探反）。
+        扭矩开着探不出（舵机会顶回目标，读数不动）：yaw 都上着力，就把 32 松几毫秒探，探完对准当前位置再上力。"""
+        if self.offset_sign is not None:
+            return self.offset_sign
+        path = os.path.join(self.calib_dir(), SIGN_FILE)
+        try:
+            rec = _load_json(path) if os.path.isfile(path) else {}
+        except (OSError, ValueError):
+            rec = {}
+        if rec.get("sign") in (1, -1) and rec.get("firmware") == self._firmware(i):
+            self.offset_sign = rec["sign"]
+            self.log(f"偏移方向用存的：读数 = 原始 {'+' if self.offset_sign > 0 else '−'} 偏移"
+                     f"（{rec.get('time', '?')}，{rec.get('how', '?')}）", "校准")
+            return self.offset_sign
+        present = self.present()
+        for j in (32, 20, 10):
+            if j in present and self.s.torque.get(j) == 0 and self.probe_offset_sign(j) is not None:
+                self._remember_sign(j, "探针")
+                return self.offset_sign
+        if 32 in present and not self.s.halted:
+            self.bus.write_u8(32, 40, 0)
+            try:
+                if self.bus.read_u8(32, 40) == 0 and self.probe_offset_sign(32) is not None:
+                    self._remember_sign(32, "探针（32 松了几毫秒）")
+            finally:
+                self.torque_on_aligned([32])
+            if self.offset_sign is not None:
+                return self.offset_sign
+        raise Refused("还不知道偏移方向：先松开 32（头左右转，不受重力）再点一次")
+
+    def _need_hold(self, i):
+        if self.bus.read_u8(i, 40) != 1:
+            raise Refused(f"#{i} 没在保持：先打开这颗的「保持」（零位微调、量旷量都要上着力做）")
+
+    def _latest_backup(self):
+        d = self.calib_dir()
+        files = sorted(f for f in os.listdir(d) if f.startswith("eeprom-")) if os.path.isdir(d) else []
+        return files[-1] if files else None
+
+    def _zero_round_file(self, i):
+        """零位微调这一轮的备份（跟中位校准同一个目录、同一种格式，「撤销上一次」认得）。一轮 = 从第一次改零位开始，
+        到有了更新的备份（又做了中位校准）或者被撤销为止。每颗第一次改之前把原值记进去，之后的改动都累加在这一份上：
+        「撤销上一次」一次撤回整轮，只碰这一轮改过的那几颗。"""
+        d = self.calib_dir()
+        fn = self.zero_round
+        if not fn or self._latest_backup() != fn:
+            os.makedirs(d, exist_ok=True)
+            fn = self._backup_name()
+            _save_json(os.path.join(d, fn), {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": "zero_trim", "servos": {},
+                                             "ref": None, "deltas": {}, "shifted": [], "sim": self.s.sim})
+            self.zero_round = fn
+            self.log(f"零位微调开始新一轮：改之前的偏移记在 {d}{os.sep}{fn}（「撤销上一次」一次撤回整轮）", "校准")
+        path = os.path.join(d, fn)
+        rec = _load_json(path)
+        if str(i) not in rec["servos"]:
+            rec["servos"][str(i)] = self._backup_row(i)
+            _save_json(path, rec)
+        return path, rec
+
+    def _shift_zero(self, i, z, why):
+        """把「现在读 z 的那个物理位置」改成读 2048：偏移改 符号 × (2048 − z)，目标 42 同时挪同样多，关节不动。
+        先限速、先写目标再写偏移（中间那一两毫秒舵机按限速慢慢走，不会窜），回读偏移核对，再马上读一次位置：
+        同一个物理位置读数应该正好变 d。变反了 = 偏移方向记反了（关节会被拉走 2d）：还原，改正方向存盘，请人再点一次。
+        没写对就把目标、偏移都还原。不关扭矩，所以没有中位校准那种下垂误差。存的姿态跟着换算，改动记进这一轮的备份。"""
+        self.guard()
+        s = self.ensure_offset_sign(i)
+        d = 2048 - int(round(z))                 # 同一个物理位置，读数变多少
+        if d == 0:
+            return 0
+        path, rec = self._zero_round_file(i)
+        done = rec["deltas"].get(str(i), 0) + d
+        if abs(done) > ZERO_ROUND_MAX:
+            raise Refused(f"#{i} 这一轮零位要改 {done * 360 / 4096:+.1f}°，超过 {ZERO_ROUND_MAX * 360 / 4096:.0f}°："
+                          "差这么多该松力重新摆，再中位校准")
+        self.stop(quiet=True)
+        bus, trail, ok, flipped = self.bus, [], False, False
+        with self.calib_lock:
+            off0 = off = self.read_off(i)
+            goal0 = feetech.sign15(bus.read_u16(i, 42))
+            p0 = self.read_pos(i)
+            off1 = off0 + s * d
+            if abs(off1) > OFFSET_LIMIT:
+                raise Refused(f"#{i} 偏移要改成 {off1}，超出 ±{OFFSET_LIMIT}，没改")
+            try:
+                bus.write_u8(i, 41, 10)                                     # 万一两包中间舵机去追目标，也是慢慢走
+                bus.write_u16(i, 46, enc_sm(200))
+                trail.append("解锁" + _ack(bus.unlock(i)))
+                trail.append(f"目标{goal0}→{goal0 + d}" + _ack(bus.write_u16(i, 42, enc_sm(goal0 + d))))
+                trail.append(f"偏移→{off1}" + _ack(self.write_off(i, off1)))
+                off, _ = self.wait_off_change(i, off0)
+                ok = off == off1
+                if ok and abs(d) > SIGN_CHECK:
+                    p1 = self.read_pos(i)
+                    if abs(p1 - (p0 + d)) > SIGN_CHECK:
+                        ok, flipped = False, abs(p1 - (p0 - d)) <= SIGN_CHECK
+                        trail.append(f"读数 {p0}→{p1}，应该是 {p0 + d}" + ("：偏移方向记反了" if flipped else ""))
+            finally:
+                try:
+                    if not ok:
+                        self.write_off(i, off0)
+                        bus.write_u16(i, 42, enc_sm(goal0))
+                        trail.append("没写对，目标、偏移已还原")
+                    bus.lock(i)
+                    self.release_speed([i])
+                except Exception as e:  # noqa: BLE001
+                    trail.append(f"✗收尾：{type(e).__name__}: {e}")
+                    self.log(f"#{i} 改零位收尾失败，这颗可能还解锁着、目标没还原：{type(e).__name__}: {e}", "校准", "error")
+            pos = self.read_pos(i)
+        self.s.refresh_static([i])
+        self.log(f"#{i} 零位微调（{why}）：同一位置读数 {round(z)}→2048（{d * 360 / 4096:+.2f}°），偏移 {fmt_off(off0)}→{fmt_off(off)}，"
+                 f"关节不动，现在读数 {pos} · " + " ".join(trail), "校准", "info" if ok else "warn")
+        if flipped:
+            self.offset_sign = -s
+            self._remember_sign(i, "改零位时读数反推")
+            raise Refused(f"#{i} 偏移方向原来记反了：已改正，零位已还原，再点一次")
+        if not ok:
+            raise Refused(f"#{i} 偏移没写对（读回 {fmt_off(off)}），目标、偏移已还原")
+        rec["deltas"][str(i)] = done
+        moved = self.shift_saved_poses({str(i): d}) if not self.s.sim else []
+        rec["shifted"] = sorted(set(rec["shifted"]) | set(moved))
+        _save_json(path, rec)
+        if moved:
+            self.log(f"存的姿态换算到新零点：{moved}", "姿态")
+        return d
+
+    def zero_jog(self, i, step):
+        """点动：只改目标 42（RAM，不写 EEPROM），一次最多 10 步；离 2048 最多 ZERO_JOG_MAX 步。"""
+        self.guard()
+        i, step = int(i), max(-10, min(10, int(step)))
+        self._need_hold(i)
+        to = feetech.sign15(self.bus.read_u16(i, 42)) + step
+        if abs(to - 2048) > ZERO_JOG_MAX:
+            raise Refused(f"#{i} 点动最多离零位 {ZERO_JOG_MAX * 360 / 4096:.0f}°：差这么多该松力重新摆，再中位校准")
+        self.bus.write_u16(i, 42, enc_sm(to))
+        return self.zero_state(i)
+
+    def zero_set(self, i):
+        """「设为零位」：点动对准了，把关节现在的位置设成零位（只换算偏移，不动关节）。"""
+        i = int(i)
+        self._need_hold(i)
+        pos, goal = self.read_pos(i), feetech.sign15(self.bus.read_u16(i, 42))
+        if abs(pos - goal) > ZERO_SET_SETTLE:
+            raise Refused(f"#{i} 读数 {pos} 离目标 {goal} 差 {pos - goal:+d} 步：还在走，或者手还推着，松手等它停稳再设")
+        self._shift_zero(i, pos, "设为零位")
+        return self.zero_state(i)
+
+    def zero_revert(self, i):
+        """「还原这颗」：偏移改回这一轮开始前的值（同样只换算，不动关节）。"""
+        i = int(i)
+        self._need_hold(i)
+        if not self.zero_round or self._latest_backup() != self.zero_round:
+            raise Refused(f"#{i} 这一轮没改过零位（或者之后又做过中位校准：用「撤销上一次」）")
+        row = _load_json(os.path.join(self.calib_dir(), self.zero_round))["servos"].get(str(i)) or {}
+        if "offset" not in row:
+            raise Refused(f"#{i} 这一轮没改过零位")
+        s = self.ensure_offset_sign(i)
+        back = s * (feetech.sign15(row["offset"]) - self.read_off(i))    # 改回去以后，同一位置的读数变多少
+        self._shift_zero(i, 2048 - back, "还原这颗")
+        return self.zero_state(i)
+
+    def play_mark(self, i, end):
+        """量总旷量：肢体推到旷量一头、点动对准参考面，记 A；推到另一头再对准，记 B。
+        记读数和当时的偏移：中间改过零位也能换算到同一个坐标。"""
+        if end not in ("a", "b"):
+            raise Refused("只能记 A 或 B")
+        i = int(i)
+        self._need_hold(i)
+        p = self.play.setdefault(i, {})
+        p[end] = {"pos": self.read_pos(i), "off": self.read_off(i)}
+        p["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.log(f"#{i} 旷量：记 {end.upper()} = 读数 {p[end]['pos']}", "校准")
+        return self.zero_state(i)
+
+    def _mark_now(self, m, off_now):
+        """记下的读数换算到现在的零位：同一个物理位置，读数 = 当时读数 + 符号 × (现在偏移 − 当时偏移)。"""
+        if not m:
+            return None
+        if m["off"] == off_now:
+            return m["pos"]
+        if self.offset_sign is None:
+            return None
+        return m["pos"] + self.offset_sign * (off_now - m["off"])
+
+    def play_center(self, i):
+        """「取中」：零位设在 A、B 的中点（只换算偏移，不动关节；点「回零位」才走过去）。"""
+        i = int(i)
+        self._need_hold(i)
+        p = self.play.get(i) or {}
+        off = self.read_off(i)
+        a, b = self._mark_now(p.get("a"), off), self._mark_now(p.get("b"), off)
+        if a is None or b is None:
+            raise Refused(f"#{i} 先记 A 和 B（肢体推到旷量两头各对准一次）")
+        self._shift_zero(i, (a + b) / 2, "取中")
+        return self.zero_state(i)
+
+    def play_wiggle(self, i, seconds=WIGGLE_S):
+        """量「读数晃动」：上力保持着，人轻推肢体来回，这边每 20 ms 读一次位置，记最大最小。编码器在输出侧
+        （fork 训练台：输出侧编码器反馈 = 电机角 + 齿隙角）：舵机里的齿隙读数看得见，舵盘、螺丝、打印件的旷量看不见，
+        总旷量减它 ≈ 舵机外面的旷量。P5 偏软，推得重读数也会跟着动，所以要轻推。"""
+        i = int(i)
+        self._need_hold(i)
+        seconds = max(1.0, min(10.0, float(seconds)))
+        lo = hi = None
+        n, end = 0, time.monotonic() + seconds
+        while time.monotonic() < end:
+            if self.s.halted:
+                raise Refused("卸力了，没量完")
+            try:
+                v = self.read_pos(i)
+                lo, hi, n = v if lo is None else min(lo, v), v if hi is None else max(hi, v), n + 1
+            except feetech.BusError:
+                pass
+            time.sleep(0.02)
+        if not n:
+            raise Refused(f"#{i} 这 {seconds:g} 秒一次都没读到")
+        span = SIM_WIGGLE[i] if self.s.sim else hi - lo
+        p = self.play.setdefault(i, {})
+        p.update({"wiggle": span, "samples": n, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        self.log(f"#{i} 读数晃动 {span} 步（{span * 360 / 4096:.2f}°，{seconds:g} 秒读了 {n} 次）"
+                 + ("（演示：假数）" if self.s.sim else ""), "校准")
+        return self.zero_state(i)
+
+    def zero_state(self, i=None):
+        """零位微调卡和旷量表要的：每颗这一轮改了多少、A / B（换算到现在的零位）、总旷量、读数晃动、舵机外面的旷量。"""
+        ids = [int(i)] if i not in (None, "") else list(IDS)
+        path = os.path.join(self.calib_dir(), self.zero_round) if self.zero_round else None
+        try:
+            deltas = _load_json(path).get("deltas", {}) if path and os.path.isfile(path) else {}
+        except (OSError, ValueError):
+            deltas = {}
+        out = {}
+        for j in ids:
+            p = self.play.get(j) or {}
+            a = b = None
+            if p.get("a") or p.get("b"):
+                try:
+                    off = self.read_off(j)
+                    a, b = self._mark_now(p.get("a"), off), self._mark_now(p.get("b"), off)
+                except feetech.BusError:
+                    pass
+            total = None if a is None or b is None else abs(a - b)
+            wig = p.get("wiggle")
+            out[str(j)] = {"changed": deltas.get(str(j), 0), "a": a, "b": b, "total": total, "wiggle": wig,
+                           "outside": None if total is None or wig is None else max(0, total - wig), "at": p.get("at")}
+        return {"servos": out, "sign": self.offset_sign, "round": self.zero_round, "jog_max": ZERO_JOG_MAX,
+                "warn_deg": PLAY_WARN_DEG, "sim": self.s.sim}
+
+    def play_save(self):
+        """旷量表落盘（state 目录 servo-play/play-时间.json；演示模式放临时目录），页面同时下载一份。"""
+        rows = []
+        for k, v in self.zero_state()["servos"].items():
+            if v["wiggle"] is None and v["total"] is None and not v["changed"]:
+                continue
+            rows.append({"id": int(k), "joint": JOINT.get(int(k)), **v,
+                         **{f"{n}_deg": None if v[n] is None else round(v[n] * 360 / 4096, 2) for n in ("wiggle", "total", "outside")}})
+        if not rows:
+            raise Refused("还没量过：先选一颗，量读数晃动或者记 A / B")
+        d = os.path.join(self.calib_dir() if self.s.sim else self.state_dir, "servo-play")
+        os.makedirs(d, exist_ok=True)
+        fn = f"play-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "sim": self.s.sim, "warn_deg": PLAY_WARN_DEG,
+               "note": "步 = 舵机读数（一圈 4096 步）；changed = 这一轮零位改动（同一位置读数的变化），wiggle = 读数晃动，"
+                       "total = 总旷量（A、B 之差），outside = 总旷量 − 读数晃动",
+               "servos": rows}
+        _save_json(os.path.join(d, fn), out)
+        self.log(f"旷量表存了 {len(rows)} 颗：{d}{os.sep}{fn}", "校准")
+        return {"file": fn, **out}
 
     # ---- 姿态 ----
 
@@ -1307,6 +1624,22 @@ class ServoOps:
             return self.timing(int(args.get("n", 200)))
         if op == "set_dir":
             return self.set_dir(args["id"], args["dir"])
+        if op == "zero_state":
+            return self.zero_state(args.get("id"))
+        if op == "zero_jog":
+            return self.zero_jog(args["id"], args.get("step", 0))
+        if op == "zero_set":
+            return self.zero_set(args["id"])
+        if op == "zero_revert":
+            return self.zero_revert(args["id"])
+        if op == "play_mark":
+            return self.play_mark(args["id"], args.get("end"))
+        if op == "play_center":
+            return self.play_center(args["id"])
+        if op == "play_wiggle":
+            return self.play_wiggle(args["id"], args.get("seconds", WIGGLE_S))
+        if op == "play_save":
+            return self.play_save()
         if op == "unlatch":
             self.s.latched = False
             self.log("解除卸力锁定：可以再上力了", "安全")

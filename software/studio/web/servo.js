@@ -5,6 +5,8 @@
 // - 右边：15 颗按左腿 / 右腿 / 头颈分三组，所有行同一套固定列宽、有表头，上下对齐；
 //   点一行才展开电压、负载、电流、偏移、P/D、方向 ±；
 // - 最下面折叠的「更多」：运动方式、存的姿态、高级工具（导出寄存器、改 ID……）、日志。
+// - 右边「零位微调 · 旷量」卡（11-08）：中位粗标以后上着力点动对准、「设为零位」（关节不动）；记 A / B 量旷量、取中；
+//   量读数晃动；量过的列成表，能存、能下载。
 // 没接管总线时数据来自主程序，只能看；点「开始调舵机」才由 Studio 接管总线（主程序停、手柄不能用）。
 // 后端是 studio/servo_ops.py（照搬 servo-web 的 server.py）。
 import { html, Component, useState, useEffect, useRef, useCallback } from './vendor/preact-htm.module.js';
@@ -38,6 +40,25 @@ const REGS = [[41, '加速度', 1, 'SRAM'], [46, '运行速度', 2, 'SRAM'], [48
 const fmt = (v, d = 0) => (typeof v === 'number' && isFinite(v) ? v.toFixed(d) : '—');
 const sign = (v, d = 1) => (typeof v === 'number' ? `${v > 0 ? '+' : ''}${v.toFixed(d)}` : '—');
 let calibHandler = null;      // ServoPage 设置：各处的「中位校准」都走同一个预览对话框
+
+// 零位参考（11-08，按官方模型算的：零位时 15 颗舵机外壳都跟躯干方正，偏差 ≤0.2°）。比的是相邻两颗舵机外壳，躯干不用摆水平。
+// 髋 roll 舵机装在 yaw 后面那个件上（只跟 yaw 转），髋 pitch、膝两颗装在大腿上，踝那颗装在小腿上。
+const ZERO_REF = {
+  hip_yaw: '俯视：髋 roll 舵机外壳跟躯干侧面平行，脚尖朝正前',
+  hip_roll: '正面看：大腿上的膝舵机跟髋 roll 舵机平行（都竖直）。别压平脚底来对：零位时脚底本身内低外高约 3.6°',
+  hip_pitch: '侧面看：大腿上的膝舵机跟髋 roll 舵机平行（都竖直），髋 pitch 舵机水平',
+  knee: '侧面看：小腿上的踝舵机跟大腿上的膝舵机平行（都竖直），小腿竖直',
+  ankle: '侧面看：脚底跟踝舵机的长边垂直（脚底跟躯干平行）',
+  neck_pitch: '侧面看：脖子上两颗舵机竖直',
+  head_pitch: '侧面看：头平视',
+  head_yaw: '俯视：头朝正前',
+  head_roll: '正面看：头不歪',
+  mouth: '嘴闭上',
+};
+const DEG = 360 / 4096;
+const refOf = (id) => ZERO_REF[(NAME_OF[id] || '').replace(/^(left|right)_/, '')] || '';
+// 方向键点动：焦点在输入框、下拉框、滑块上时让给它们自己
+const typingEl = (el) => !!el && (el.isContentEditable || ['INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName));
 
 // ---------------- 3D ----------------
 
@@ -108,10 +129,14 @@ function Why() {
     <h3>为什么要人去摆、去标零位</h3>
     <ol>
       <li>每颗舵机里有一个编码器，转一圈是 0–4095 共 4096 格。舵盘是一齿一齿装上去的，每颗装进去的角度都不一样，差一两齿就是好几度。</li>
-      <li><b>标定</b>就是照上面这张图，把鸭子摆成官方零位（腿伸直、头摆正、嘴闭上），告诉每颗舵机「你现在这个位置就是 <b>2048</b>」，写进舵机里。</li>
+      <li><b>标定</b>就是照上面这张图，把鸭子摆成官方零位，告诉每颗舵机「你现在这个位置就是 <b>2048</b>」，写进舵机里。
+        零位的样子：每颗舵机外壳都跟躯干方正——膝、踝、髋 roll 三颗竖直，髋 pitch 那颗水平；小腿竖直；侧面看脚底跟躯干平行；头平视、嘴闭上。</li>
+      <li>正面看，零位时脚底本身就内低外高约 3.6°（脚上的零件就是这么画的）：别把脚底压平在桌上来对髋 roll，那样每边差 3.6°。</li>
       <li>标好以后，机器读到 2048 就知道这个关节正好在零位。官方程序、训练出来的走路策略、Studio，<b>全部以 2048 为零</b>来算角度。</li>
       <li>没标好的话，策略以为腿是直的，实际弯了几度：走起来会歪、会蹭地、容易摔。</li>
       <li>机器自己不知道零件装成了什么样，只能由人照官方零位摆好，所以这一步要人来做。</li>
+      <li>手摆总有一两度误差：先「中位」粗标，再用「零位微调」上着力一步步推到对准（1 步 0.09°，不关扭矩、没有下垂误差）；
+        有旷量的关节用「记 A / 记 B / 取中」。</li>
     </ol>
   </section>`;
 }
@@ -241,7 +266,7 @@ function Toolbar({ open, op, link, motion, setMotion, idle, setIdle, follow, set
       title="这一页的急停（空格键也是）：15 颗全部卸力并回读确认；卸完后台不会再自动上力，自己点「全部扭矩开」或「保持」就恢复">全部扭矩关</button>
     <button class="btn-light" onClick=${syncSliders}>滑块对齐当前位置</button>
     <button class="btn-light" disabled=${!open} onClick=${() => op({ op: 'official', key: 'zero', ...ms })}
-      title="零位 = 腿伸直、脚板垂直、头平视、嘴闭上，官方定义这时每颗都是 2048">全部回零位（2048）</button>
+      title="零位 = 每颗舵机外壳跟躯干方正（膝、踝、髋 roll 竖直，髋 pitch 水平）、小腿竖直、侧面看脚底跟躯干平行、头平视、嘴闭上；官方定义这时每颗都是 2048">全部回零位（2048）</button>
     <button class="btn-light" disabled=${!open} onClick=${() => goNamed('站姿', 'stand')}
       title="存的姿态里名字带「站姿」的（实机调好的）；没有才用官方站姿">站姿</button>
     <button class="btn-light" disabled=${!open} onClick=${() => goNamed('缩起来', null)} title="存的姿态里名字带「缩起来」的">缩起来</button>
@@ -256,7 +281,7 @@ function Toolbar({ open, op, link, motion, setMotion, idle, setIdle, follow, set
   </div>`;
 }
 
-function CalibCard({ open, op, selected, onSelect, rows }) {
+function CalibCard({ open, op, selected, onSelect, rows, refreshZero }) {
   const [ids, setIds] = useState('20-24,30-34,10-14');
   return html`<section class="board sv-card sv-calib">
     <div class="sv-form">
@@ -270,11 +295,154 @@ function CalibCard({ open, op, selected, onSelect, rows }) {
       <div class="sv-ctrl">
         <input type="text" value=${ids} onInput=${(e) => setIds(e.target.value)} title="校准哪些舵机" class="sv-ids" />
         <button class="btn-dark" disabled=${!open} onClick=${() => calibHandler && calibHandler(ids)}>一键校准</button>
-        <button class="btn-light" disabled=${!open} onClick=${() => { if (window.confirm('撤销上一次校准：把那次备份的偏移写回去？')) op({ op: 'undo' }, 30000); }}>撤销上一次</button>
+        <button class="btn-light" disabled=${!open} onClick=${async () => { if (window.confirm('撤销上一次校准（或者整轮零位微调）：把那次备份的偏移写回去？')) { await op({ op: 'undo' }, 30000); refreshZero(); } }}>撤销上一次</button>
       </div>
-      <span></span><p class="sv-small">把鸭子摆成官方零位（腿伸直、头摆正、嘴闭上）再点：现在的位置设成 2048。先出预览，确认了才写；校完自动保持住。</p>
+      <span></span><p class="sv-small">把鸭子摆成官方零位（舵机外壳跟躯干方正，看左边 3D 的「零位」）再点：现在的位置设成 2048。先出预览，确认了才写；校完自动保持住。差一点的，用下面「零位微调」推到对准。</p>
     </div>
   </section>`;
+}
+
+// ---------------- 零位微调、旷量（11-08） ----------------
+// 手摆总有一两度误差：「中位」粗标以后，上着力一步步点动到对准（只改目标，不写 EEPROM），点「设为零位」只换算偏移、
+// 关节不动（不关扭矩，没有下垂误差）。有旷量的关节：肢体推到两头各对准一次，记 A / B，「取中」零位设在中点。
+// 「读数晃动」= 上力时轻推、编码器看得见的那部分（舵机里的齿隙）；总旷量减它 ≈ 舵机外面的（舵盘、螺丝、打印件）。
+// 后端 servo_ops.zero_* / play_*；一轮改动记在一份备份上，「撤销上一次」一次撤回整轮。显示都按模型方向（跟「角度」列一样）。
+
+function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }) {
+  const r = (rows || []).find((x) => x.id === selected);
+  const z = (selected && zs?.servos?.[selected]) || {};
+  const hold = !!(open && r && r.torque === 1);
+  const [busy, setBusy] = useState(null);          // 正在做的：'set' / 'revert' / 'a' / 'b' / 'center' / 'wiggle'
+  const cur = useRef({});
+  const last = useRef(0);
+  cur.current = { r, hold };
+  const call = useCallback(async (args, timeout = 15000, quiet = false) => {
+    const res = await op(args, timeout, quiet);
+    if (res.ok && res.data?.servos) mergeZero(res.data);
+    return res;
+  }, [op, mergeZero]);
+  // 点动 k 步（模型方向）：读数方向要乘这颗的方向 ±
+  const jog = (k) => {
+    const { r: x, hold: h } = cur.current;
+    if (!x) return;
+    if (!h) { setHint(`${x.id} ${x.cn} 没在保持：先打开它的「保持」再点动`); return; }
+    call({ op: 'zero_jog', id: x.id, step: x.dir * k }, 3000, true);
+  };
+  useEffect(() => {
+    if (!open || !selected) return undefined;
+    const down = (e) => {
+      if ((e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') || e.ctrlKey || e.altKey || e.metaKey || typingEl(e.target)) return;
+      e.preventDefault();
+      const now = performance.now();
+      if (now - last.current < 60) return;           // 按住自动重复：最多每秒十几次
+      last.current = now;
+      jog((e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 10 : 1));
+    };
+    window.addEventListener('keydown', down);
+    return () => window.removeEventListener('keydown', down);
+  }, [open, selected]);
+  const run = async (name, args, timeout) => {
+    setBusy(name);
+    try { return await call(args, timeout); } finally { setBusy(null); }
+  };
+
+  if (!r) {
+    return html`<section class="board sv-card sv-trim">
+      <h3>零位微调 · 旷量</h3>
+      <div class="sv-ctrl"><${ServoPick} selected=${selected} onSelect=${onSelect} rows=${rows} />
+        <span class="sv-small">先「中位」粗标，再选一颗在这里一步步推到对准（1 步 0.09°，键盘 ← →，Shift 一次 10 步）</span></div>
+      <${PlayTable} rows=${rows} zs=${zs} op=${op} setHint=${setHint} />
+    </section>`;
+  }
+  const deg = (steps) => (steps == null ? '—' : sign(r.dir * steps * DEG, 2) + '°');
+  const abs = (steps) => (steps == null ? '—' : fmt(steps * DEG, 2) + '°');
+  const warnCls = (steps) => (steps != null && steps * DEG > (zs?.warn_deg ?? 2) ? 'num sv-warn-b' : 'num');
+  const moved = z.changed ? -z.changed : 0;         // 这一轮零位挪了多少（读数步）：同一个物理位置读数变化的相反数
+  return html`<section class="board sv-card sv-trim">
+    <h3>零位微调 · 旷量</h3>
+    <div class="sv-form">
+      <span class="sv-label">舵机</span>
+      <div class="sv-ctrl"><${ServoPick} selected=${selected} onSelect=${onSelect} rows=${rows} />
+        ${open && !hold ? html`<span class="sv-warn">没在保持：先打开它的「保持」（或「全部回零位」）</span>` : null}</div>
+      <span class="sv-label">对准看</span>
+      <p class="sv-small sv-ref">${refOf(r.id)}</p>
+      <span class="sv-label">现在</span>
+      <div class="sv-ctrl"><b class="num sv-big">${r.raw == null ? '—' : deg(r.raw - 2048)}</b>
+        <span class="sv-small num">读数离零位 ${r.raw == null ? '—' : sign(r.dir * (r.raw - 2048), 0)} 步 · 目标 ${r.goal == null ? '—' : sign(r.dir * (r.goal - 2048), 0)} 步</span></div>
+      <span class="sv-label">点动</span>
+      <div class="sv-ctrl">
+        ${[-10, -1, 1, 10].map((k) => html`<button class="btn-light sv-jog" disabled=${!hold} onClick=${() => jog(k)}>${k > 0 ? '+' + k : k}</button>`)}
+        <button class="btn-light" disabled=${!hold} onClick=${() => op({ op: 'move', goals: { [r.id]: 2048 }, seconds: 0.6 })}
+          title="这颗走回 2048：零位改过以后，看新零位在哪">回零位</button>
+        <span class="sv-small">键盘 ← →，Shift 一次 10 步 · 1 步 0.09°</span>
+      </div>
+      <span class="sv-label">零位</span>
+      <div class="sv-ctrl">
+        <button class="btn-dark" disabled=${!hold || !!busy} onClick=${async () => {
+          const res = await run('set', { op: 'zero_set', id: r.id });
+          if (res.ok) setHint(`${r.id} ${r.cn}：现在的位置设成了零位（关节没动）。零位改过以后，站姿 IMU 标定要重做`);
+        }} title="把关节现在的位置设成零位：只换算偏移，关节不动，不关扭矩">设为零位</button>
+        <span class="sv-small num">这一轮挪了 ${deg(moved)}</span>
+        <button class="btn-light" disabled=${!hold || !!busy || !z.changed} onClick=${() => run('revert', { op: 'zero_revert', id: r.id })}
+          title="这颗的零位改回这一轮开始前（关节不动）">还原这颗</button>
+      </div>
+      <span class="sv-label">旷量</span>
+      <div class="sv-ctrl">
+        <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('a', { op: 'play_mark', id: r.id, end: 'a' })}
+          title="肢体推到旷量一头，点动对准参考面，再点这里">记 A</button>
+        <span class="sv-small num">${z.a == null ? 'A —' : 'A ' + deg(z.a - 2048)}</span>
+        <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('b', { op: 'play_mark', id: r.id, end: 'b' })}
+          title="肢体推到旷量另一头，点动对准参考面，再点这里">记 B</button>
+        <span class="sv-small num">${z.b == null ? 'B —' : 'B ' + deg(z.b - 2048)}</span>
+        <span class=${warnCls(z.total)}>总旷量 ${abs(z.total)}</span>
+        <button class="btn-light" disabled=${!hold || !!busy || z.total == null} onClick=${() => run('center', { op: 'play_center', id: r.id })}
+          title="零位设在 A、B 中点（关节不动；点「回零位」走过去看）">取中</button>
+      </div>
+      <span></span>
+      <div class="sv-ctrl">
+        <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('wiggle', { op: 'play_wiggle', id: r.id, seconds: 5 }, 20000)}>
+          ${busy === 'wiggle' ? '量着：轻推来回…' : '量读数晃动（5 秒）'}</button>
+        <span class=${warnCls(z.wiggle)}>读数晃动 ${abs(z.wiggle)}</span>
+        <span class="sv-small num">舵机外面 ≈ ${abs(z.outside)}</span>
+        ${zs?.sim ? html`<span class="sv-small">（演示：读数晃动是假数）</span>` : null}
+      </div>
+      <span></span>
+      <p class="sv-small">总旷量 = 肢体推到两头各对准一次的差；读数晃动 = 上着力轻推时编码器看得见的（舵机里的齿隙，推重了会多）；
+        相减 ≈ 舵盘、螺丝、打印件的。超过 ${zs?.warn_deg ?? 2}° 标黄：训练里按每个关节 ±1°（总 2°）的齿隙练的。零位改过以后，站姿 IMU 标定要重做。</p>
+    </div>
+    <${PlayTable} rows=${rows} zs=${zs} op=${op} setHint=${setHint} />
+  </section>`;
+}
+
+// 量过的列成一张表：存进 Studio 的 state（servo-play/），同时下载一份；也能复制成 Markdown
+function PlayTable({ rows, zs, op, setHint }) {
+  const [saved, setSaved] = useState(null);
+  const warnDeg = zs?.warn_deg ?? 2;
+  const list = (rows || []).filter((r) => { const z = zs?.servos?.[r.id]; return z && (z.wiggle != null || z.total != null || z.changed); });
+  const d = (steps) => (steps == null ? '—' : (steps * DEG).toFixed(2) + '°');
+  const cell = (steps) => html`<td class=${'r num' + (steps != null && steps * DEG > warnDeg ? ' warn' : '')}>${d(steps)}</td>`;
+  const zeroMoved = (r, z) => (z.changed ? sign(-r.dir * z.changed * DEG, 2) + '°' : '—');
+  const save = async () => {
+    const res = await op({ op: 'play_save' });
+    if (!res.ok) return;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(res.data, null, 1)], { type: 'application/json' }));
+    a.download = res.data.file; a.click();
+    setSaved(res.data.file);
+  };
+  const md = () => ['| 舵机 | 读数晃动 | 总旷量 | 舵机外面≈ | 这一轮零位 |', '|---|---|---|---|---|',
+    ...list.map((r) => { const z = zs.servos[r.id]; return `| ${r.id} ${r.cn} | ${d(z.wiggle)} | ${d(z.total)} | ${d(z.outside)} | ${zeroMoved(r, z)} |`; })].join('\n');
+  return html`<details class="sv-playtab">
+    <summary>旷量表（量过 ${list.length} 颗）</summary>
+    ${list.length ? html`<table class="sv-plan"><thead><tr><th>舵机</th><th class="r">读数晃动</th><th class="r">总旷量</th>
+        <th class="r">舵机外面≈</th><th class="r">这一轮零位</th></tr></thead>
+      <tbody>${list.map((r) => { const z = zs.servos[r.id]; return html`<tr><td>${r.id} ${r.cn}</td>${cell(z.wiggle)}${cell(z.total)}${cell(z.outside)}
+        <td class="r num">${zeroMoved(r, z)}</td></tr>`; })}</tbody></table>
+      <div class="sv-ctrl"><button class="btn-light" onClick=${save}>存表并下载 JSON</button>
+        <button class="btn-light" onClick=${() => { navigator.clipboard?.writeText(md()); setHint('旷量表已复制成 Markdown'); }}>复制 Markdown 表</button>
+        ${saved ? html`<span class="sv-small">已存：${saved}（Studio 的 state/servo-play/ 里也有）</span>` : null}</div>`
+      : html`<p class="sv-small">还没量过：选一颗，量读数晃动或者记 A / B</p>`}
+  </details>`;
 }
 
 // ---------------- 更多（折叠） ----------------
@@ -409,7 +577,7 @@ function CalibDialog({ plan, onOk, onCancel }) {
   return html`<div class="sv-modal" role="dialog" aria-modal="true">
     <div class="board sv-modal-box">
       <h2>中位校准（官方零位 2048）</h2>
-      <p class="sv-small">鸭子要摆成官方零位：腿伸直、头摆正、嘴闭上。每颗只关几毫秒扭矩；校完自动保持住。${plan.sim ? '（演示：没接舵机，校的是假的）' : ''}</p>
+      <p class="sv-small">鸭子要摆成官方零位：舵机外壳跟躯干方正、小腿竖直、头平视、嘴闭上。每颗只关几毫秒扭矩；校完自动保持住。${plan.sim ? '（演示：没接舵机，校的是假的）' : ''}</p>
       <table class="sv-plan"><thead><tr><th>舵机</th><th class="r">现在</th><th class="r">写成</th><th class="r">差</th></tr></thead>
         <tbody>${plan.rows.map((r) => html`<tr class=${big.includes(r) ? 'big' : ''}><td>${r.id}</td><td class="r num">${fmt(r.pos)}</td>
           <td class="r num">2048</td><td class="r num">${r.diff_deg == null ? '读不到' : sign(r.diff_deg) + '°'}</td></tr>`)}</tbody></table>
@@ -449,6 +617,7 @@ export function ServoPage({ sv, link, leaveGuards }) {
   const [poses, setPoses] = useState([]);
   const [idle, setIdle] = useState(false);
   const [plan, setPlan] = useState(null);
+  const [zs, setZs] = useState(null);             // 零位微调、旷量（servo_ops.zero_state）
   const [syncKey, setSyncKey] = useState(0);
   const open = sv?.state === 'open';
   // 滑块对齐当前位置：重建表格，所有滑块丢掉拖动中的值、回到实际读数（平时松手 0.6 秒也会自己回去）
@@ -457,6 +626,7 @@ export function ServoPage({ sv, link, leaveGuards }) {
 
   // 这几个函数要固定不变（useCallback）：每行按「数据变没变」决定重不重画，函数一变就白比了
   const onSelect = useCallback((id) => setSelected(id), []);
+  const mergeZero = useCallback((d) => setZs((z) => ({ ...(z || {}), ...d, servos: { ...(z?.servos || {}), ...(d.servos || {}) } })), []);
   // 舵机操作：不成就在页头显示原因；quiet = 滑块这种高频的，成功了不打扰
   const op = useCallback(async (args, timeout = 15000, quiet = false) => {
     const r = await link.cmd('servo.op', args, timeout);
@@ -493,6 +663,8 @@ export function ServoPage({ sv, link, leaveGuards }) {
     if (r.ok) setPlan({ ...r.data, ids: text });
   }, []);
   useEffect(() => { if (open) op({ op: 'poses' }).then((r) => r.ok && setPoses(r.data.poses)); else setIdle(false); }, [open]);
+  const refreshZero = useCallback(() => op({ op: 'zero_state' }, 15000, true).then((r) => r.ok && setZs(r.data)), []);
+  useEffect(() => { if (open) refreshZero(); else setZs(null); }, [open]);
   useEffect(() => { if (!hint) return undefined; const t = setTimeout(() => setHint(null), 4000); return () => clearTimeout(t); }, [hint]);
 
   const dr = sv?.drop_rate;
@@ -544,7 +716,8 @@ export function ServoPage({ sv, link, leaveGuards }) {
         ${pose === 'zero' ? html`<${Why} />` : null}
       </div>
       <div class="sv-right">
-        <${CalibCard} open=${open} op=${op} selected=${selected} onSelect=${onSelect} rows=${sv?.rows} />
+        <${CalibCard} open=${open} op=${op} selected=${selected} onSelect=${onSelect} rows=${sv?.rows} refreshZero=${refreshZero} />
+        <${TrimCard} open=${open} op=${op} selected=${selected} onSelect=${onSelect} rows=${sv?.rows} zs=${zs} mergeZero=${mergeZero} setHint=${setHint} />
         <${ServoList} key=${'list' + syncKey} sv=${sv || { rows: [] }} open=${open} selected=${selected} onSelect=${onSelect} op=${op} follow=${follow} setHint=${setHint} />
       </div>
     </div>
@@ -556,6 +729,7 @@ export function ServoPage({ sv, link, leaveGuards }) {
       if (r.ok) {
         const d = r.data, bad = Object.keys(d.bad || {});
         setHint(`校准完：成功 ${d.ok.length} 颗${bad.length ? `，失败 ${bad.join('、')}（看日志）` : ''}；成功的已经保持住`);
+        refreshZero();
       }
     }} />` : null}
   </div>`;

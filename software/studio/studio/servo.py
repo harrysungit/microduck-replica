@@ -53,7 +53,8 @@ LEAVE_WAIT_S = 3.0            # 离开舵机页：等在路上的舵机操作做
 HANDBACK_WAIT_S = 10.0        # 点「交还主程序」：同上（校准看到 closing 会在下一颗前停）
 # 这几样在跑 = 「活还没干完」：离开舵机页不交还（第三批代码审查 D3a：一键校准跑着时离开，后面几颗被卸力锁打断）
 BUSY_OPS = {"calibrate": "正在校准", "undo": "正在撤销校准", "timing": "正在测总线时序", "scan_all": "正在扫全网",
-            "scan": "正在扫描", "set_id": "正在改 ID", "reboot": "正在重启舵机", "write_reg": "正在写寄存器"}
+            "scan": "正在扫描", "set_id": "正在改 ID", "reboot": "正在重启舵机", "write_reg": "正在写寄存器",
+            "zero_set": "正在改零位", "zero_revert": "正在改零位", "play_center": "正在改零位", "play_wiggle": "正在量旷量"}
 
 
 class Refused(Exception):
@@ -622,7 +623,7 @@ class ServoSession:
             cn, en = NAMES[sid]
             rows.append({
                 "id": sid, "cn": cn, "en": en, "group": GROUP[sid], "dir": self.directions[sid],
-                "raw": s["pos"] if s else None,
+                "raw": s["pos"] if s else None, "goal": s["goal"] if s else None,
                 "deg": round(angle_deg(s["pos"], self.directions[sid]), 1) if s else None,
                 "volt": s["volt"] if s else None, "temp": s["temp"] if s else None,
                 "temp_limit": st.get("temp_limit"), "load": s["load"] if s else None,
