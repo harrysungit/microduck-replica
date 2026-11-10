@@ -167,11 +167,14 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
     def update_readiness(*,native_transaction=None):
         busy = any(not task.done() for task in update_commands) or model_upload_gate.locked()
         motion = getattr(pad,'motion_studio',None)
-        native=updates.native_state() if native_transaction is not None else {}
+        native=updates.native_state()
         own_prepared=(native.get('bundle_schema')=='microduck-controller-payload/1' and native.get('active') is True
             and native.get('phase')=='prepared' and isinstance(native_transaction,str)
             and native.get('transaction_id')==native_transaction)
-        guarded=updates.marker.exists() or (updates.installing() and not own_prepared)
+        # Software preflight runs after its coordinator creates the motion guard.
+        # Native recovery must still refuse a concurrent software transaction.
+        software_conflict=native_transaction is not None and updates.marker.exists()
+        guarded=software_conflict or (native.get('active') is True and not own_prepared)
         if (guarded or busy or (servo is not None and servo.state != 'closed')
             or mapping_requests or (pad is not None and getattr(getattr(pad,'mapping',None),'blocked',False))
             or (motion is not None and (motion.state != 'idle' or motion.session is not None))
