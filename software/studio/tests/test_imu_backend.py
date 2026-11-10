@@ -46,6 +46,10 @@ class FakeCmd:
             action = (params or {}).get("action")
             if action == "calibration-status":
                 return self.rd.calib.value
+            if action == "check-imu":
+                return self.rd.check(params)
+            if action == "save-checked-imu":
+                return self.rd.save_checked(params)
             if action == "verify-imu":
                 return self.rd.verify(params)
         raise RpcError(method, -32601, "method not found")
@@ -61,7 +65,7 @@ class FakeRd:
         self.addr, self.verify_plan = None, "ok"
         self.cmd = FakeCmd(self)
 
-    def verify(self, params):
+    def proof(self, params):
         plan = self.verify_plan
         if plan == "no_sample":
             raise RpcError("robot.busCommand", -32603,
@@ -81,6 +85,23 @@ class FakeRd:
         q = [float(x) for x in params["mount_wxyz"]]
         n = math.sqrt(sum(x * x for x in q))
         q = [x / n for x in q]
+        src = (self.calib.value or {}).get("imu_source") or "bus"
+        return {"upright":{"imu_source":src},"nose_down":{"tilt_from_upright_deg":20.,"lean_heading_deg":0.},"residual_tilt_deg":1.}
+
+    def check(self, params):
+        proof=self.proof(params)
+        self.checked=copy.deepcopy(params["mount_wxyz"])
+        return {"verified":True,"saved":False,"verification_id":"test-imu-proof", "expires_in_seconds":300,
+                "mount_wxyz":self.checked,"imu_check":proof}
+
+    def save_checked(self, params):
+        if params.get("verification_id")!="test-imu-proof":raise RpcError("robot.busCommand",-32600,"unknown proof")
+        return {**self.verify({"mount_wxyz":self.checked}),"saved":True}
+
+    def verify(self, params):
+        proof=self.proof(params)
+        q=[float(x) for x in params["mount_wxyz"]]
+        n=math.sqrt(sum(x*x for x in q));q=[x/n for x in q]
         cal = copy.deepcopy(self.calib.value or {})
         cal.setdefault("calibration", {})
         src = cal.get("imu_source") or "bus"
@@ -122,7 +143,8 @@ def factory_calib(source="bus"):
     if source != "bus":
         cal["imu_mounts"][source] = {"quat": [0.5, 0.5, 0.5, 0.5], "verified": False}
     return {"calibration": cal, "imu_source": source,
-            "imu_verification_contract": "upright_nose_down_v1"}
+            "imu_verification_contract": "upright_nose_down_v1",
+            "imu_staged_verification_contract":"check_then_relax_save_v1"}
 
 
 def bus_transport(protocol="dxl2", board="sflp_124_12", identity=None):
@@ -139,6 +161,35 @@ class ImuBackendTest(unittest.TestCase):
 
     def backend(self, **kw):
         return ImuBackend(FakeRd(**kw), self.log, self.tmp.name)
+
+    def test_verification_keeps_upright_cue_until_robotd_accepts_upright(self):
+        b = self.backend(bus=commissioning_bus(), calib=factory_calib())
+        b.job = {"kind": "coarse", "title": "交给主程序验证"}
+        self.assertIsNone(b.view()["verification_phase"])
+        self.assertIn("暂不要前倾", b.view()["job"]["msg"])
+        b.rd.bus.value["imu_verification"] = "verify-imu: tip the robot nose-down"
+        view = b.view()
+        self.assertEqual(view["verification_phase"], "nose_down")
+        self.assertIn("直立已通过", view["job"]["title"])
+        self.assertIn("20 秒", view["job"]["msg"])
+        self.assertEqual(b.job["title"], "交给主程序验证", "view must not overwrite job lifecycle")
+
+    def test_motion_or_missing_stage_cannot_claim_upright_has_passed(self):
+        bus = commissioning_bus(mode="motion")
+        bus["imu_verification"] = "stale commissioning stage"
+        b = self.backend(bus=bus, calib=factory_calib())
+        self.assertIsNone(b.view()["verification_phase"])
+        for value in (None, "", {}, True):
+            b.rd.bus.value.update(mode="commissioning", imu_verification=value)
+            with self.subTest(value=value):
+                self.assertIsNone(b.view()["verification_phase"])
+
+    def test_verification_failure_is_preserved_instead_of_showing_forward_cue(self):
+        bus = commissioning_bus()
+        bus["imu_verification"] = "verify-imu: tip the robot nose-down"
+        b = self.backend(bus=bus, calib=factory_calib())
+        b.job = {"kind": "coarse", "title": "主程序验证没通过", "failed": True, "msg": "Nothing saved"}
+        self.assertEqual(b.view()["job"], b.job)
 
     def test_view_picks_mount_of_chip_in_use(self):
         # 二号鸭用 LSM6DSV16X：要取 imu_mounts 里它那份，不是顶上那个（那是另一种芯片的）
@@ -265,12 +316,12 @@ class ImuBackendTest(unittest.TestCase):
         b.view()
         q = [0.5] * 4
         b.last_result = {"ok": True, "mode": "coarse", "mount": q}
-        original = b.rd.verify
+        original = b.rd.check
         def changed(params):
             result = original(params)
             bus["imu_bus"]["identity"] = [8, 8, 8]
             return result
-        b.rd.verify = changed
+        b.rd.check = changed
         with self.assertRaisesRegex(Refused, "改变"):
             asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}))
         self.assertFalse((b.job or {}).get("done"))
@@ -291,6 +342,8 @@ class ImuBackendTest(unittest.TestCase):
             return reply
         b.rd.verify = bound
         result = asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}))
+        self.assertFalse(b.rd.calib.value["calibration"].get("imu_mount_verified",False))
+        asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"},"test"))
         self.assertTrue(result["ok"])
         self.assertIs(b.view()["mount"]["verified"], True)
         self.assertIsNone(commit.load_pending(self.tmp.name))
@@ -378,6 +431,8 @@ class ImuBackendTest(unittest.TestCase):
         b.last_result = {"ok": True, "mode": "coarse", "mount": mount}
         rd.verify_plan = "ok"
         res = asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": mount}, "测试"))
+        self.assertIsNotNone(b._pending_verification)
+        asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"},"test"))
         self.assertTrue(res["ok"], res)
         v = b.view()
         self.assertEqual(v["source"], "lsm6dsv16x")
@@ -392,7 +447,7 @@ class ImuBackendTest(unittest.TestCase):
                 b.last_result = {"ok": True, "mode": "coarse", "mount": q}
                 original_calibration = copy.deepcopy(b.rd.calib.value)
                 current = copy.deepcopy(original_calibration)
-                current["imu_verification_contract"] = contract
+                current["imu_staged_verification_contract"] = contract
                 original = b.rd.cmd.call
 
                 async def latest(method, params, timeout):
@@ -402,7 +457,7 @@ class ImuBackendTest(unittest.TestCase):
 
                 b.rd.cmd.call = latest
                 with mock.patch.object(b.rd, "verify", wraps=b.rd.verify) as save:
-                    with self.assertRaisesRegex(Refused, "API43"):
+                    with self.assertRaisesRegex(Refused, "API44"):
                         asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}))
                 save.assert_not_called()
                 self.assertEqual(b.rd.calib.value, original_calibration)
@@ -418,7 +473,7 @@ class ImuBackendTest(unittest.TestCase):
                     b = self.backend(bus=commissioning_bus(source), calib=factory_calib(source))
                     q = [0.5] * 4
                     b.last_result = {"ok": True, "mode": "coarse", "mount": q}
-                    original = b.rd.verify
+                    original = b.rd.check
 
                     def unproven(params):
                         result = original(params)
@@ -442,7 +497,7 @@ class ImuBackendTest(unittest.TestCase):
                                 "heading-low": -20.1, "heading-high": 20.1, "heading-nan": float("nan")}[corrupt]
                         return result
 
-                    b.rd.verify = unproven
+                    b.rd.check = unproven
                     session = {"active": True, "phase": "commissioning", "session_id": "f"*32,
                                "source": source, "original_mode": "commissioning"}
                     with mock.patch.object(helper, "imu_redo_state", return_value=session), \
@@ -460,7 +515,7 @@ class ImuBackendTest(unittest.TestCase):
                 b = self.backend(bus=commissioning_bus(), calib=factory_calib())
                 q = [0.5] * 4
                 b.last_result = {"ok": True, "mode": "coarse", "mount": q}
-                original = b.rd.verify
+                original = b.rd.check
 
                 def boundary(params):
                     result = original(params)
@@ -468,7 +523,7 @@ class ImuBackendTest(unittest.TestCase):
                     result["imu_check"]["nose_down"].update(tilt_from_upright_deg=12.0, lean_heading_deg=heading)
                     return result
 
-                b.rd.verify = boundary
+                b.rd.check = boundary
                 result = asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}))
                 self.assertTrue(result["ok"])
 
@@ -538,9 +593,10 @@ class ImuBackendTest(unittest.TestCase):
                         status["calibration"]["imu_mount_verified"] = False
                     return status
                 return await original(method, params, timeout)
+            asyncio.run(b.handle({"op":"verify","confirmed":True,"mount_wxyz":q}))
             b.rd.cmd.call = broken
             with self.subTest(corrupt=corrupt), self.assertRaises(Refused):
-                asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}))
+                asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"}))
             self.assertTrue(b.rd.calib.value["calibration"]["imu_mount_verified"])
             self.assertFalse((b.job or {}).get("done"))
 
@@ -657,18 +713,25 @@ class ImuBackendTest(unittest.TestCase):
             with self.subTest(session=session_change), mock.patch.object(helper, "imu_redo_state", return_value=session), self.assertRaises(Refused):
                 backend._coarse_guard(bus)
 
-    def test_redo_verify_while_holding_requires_unload_before_rpc(self):
+    def test_redo_verify_while_holding_is_readonly_and_save_waits_for_unload(self):
         from studio import helper
         bus = commissioning_bus()
-        bus.update(phase="holding", torque_state="all_enabled", hold={"stage": "holding", "max_error_deg": 0.6})
-        backend = self.backend(bus=bus, calib=factory_calib())
-        backend.last_result = {"ok": True, "mode": "coarse", "mount": [1., 0., 0., 0.]}
-        backend._rpc_once = mock.AsyncMock(return_value={"accepted": True})
-        session = {"active": True, "phase": "commissioning", "source": "bus", "session_id": "c" * 32}
-        with mock.patch.object(helper, "imu_redo_state", return_value=session), self.assertRaisesRegex(Refused, "卸力"):
-            asyncio.run(backend.handle({"op": "verify", "confirmed": True, "mount_wxyz": [1., 0., 0., 0.]}))
-        backend._rpc_once.assert_not_awaited()
-        self.assertIsNotNone(backend.last_result)
+        bus.update(phase="holding", torque_state="all_enabled", hold={"stage":"holding","max_error_deg":.6})
+        b=self.backend(bus=bus,calib=factory_calib());q=[1.,0.,0.,0.]
+        b.last_result={"ok":True,"mode":"coarse","mount":q}
+        session={"active":True,"phase":"commissioning","source":"bus","session_id":"c"*32,"original_mode":"commissioning"}
+        before=copy.deepcopy(b.rd.calib.value)
+        with mock.patch.object(helper,"imu_redo_state",return_value=session),mock.patch.object(helper,"imu_recalibrate",return_value=(True,"finished",{})) as finish:
+            result=asyncio.run(b.handle({"op":"verify","confirmed":True,"mount_wxyz":q}))
+            self.assertTrue(result["verified"]);self.assertFalse(result["saved"])
+            self.assertEqual(b.rd.calib.value,before);finish.assert_not_called()
+            with self.assertRaisesRegex(Refused,"卸力"):
+                asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"}))
+            self.assertEqual(b.rd.calib.value,before);finish.assert_not_called()
+            bus.update(phase="ready",torque_state="off",hold=None)
+            saved=asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"}))
+            self.assertTrue(saved["saved"]);finish.assert_called_once()
+
 
     def test_hold_blocks_collection_and_mode_switch_until_completion(self):
         from studio import helper
@@ -801,6 +864,8 @@ class ImuBackendTest(unittest.TestCase):
         with mock.patch.object(helper, "imu_redo_state", side_effect=lambda **_: dict(session)), \
              mock.patch.object(helper, "imu_recalibrate", side_effect=finish) as call:
             res = asyncio.run(b.handle({"op": "verify", "confirmed": True, "mount_wxyz": q}, "test"))
+            self.assertIsNotNone(b._pending_verification)
+            asyncio.run(b.handle({"op":"save-verified","confirmed":True,"verification_id":"test-imu-proof"},"test"))
         self.assertTrue(res["ok"])
         self.assertEqual(call.call_count, 1)
 

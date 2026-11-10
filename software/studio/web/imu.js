@@ -125,6 +125,23 @@ function qRotate(q, v) {
   return r.map((row) => dot(row, v));
 }
 
+// gravity is expressed under the saved mount; correction maps it to the candidate mount.
+function candidateTilt(gravity, correction) {
+  if (!okVec(gravity) || !unit(gravity) || !Array.isArray(correction) || correction.length !== 4
+      || !correction.every((x) => typeof x === 'number' && Number.isFinite(x))) return null;
+  const norm = Math.hypot(...correction);
+  if (norm < 1e-12) return null;
+  return angle(DOWN, qRotate(correction.map((x) => x / norm), gravity));
+}
+
+function verificationCue(phase) {
+  return phase === 'nose_down'
+    ? { title: '直立已通过：现在将躯干前倾 15–30° 并停住',
+      detail: '20 秒内完成。双手托住整个躯干向前倾，不要只低头，也不要向左右歪。' }
+    : { title: '保持直立，暂不要前倾',
+      detail: '主程序可能正在切换模式或检查直立。保持采静止时的姿态，等这里显示「直立已通过」再前倾。' };
+}
+
 const fmt = (v, d = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
 const sgn = (v, d = 1) => (typeof v === 'number' && Number.isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(d)}` : '—');
 const dirDiff = (a, b) => Math.abs(((a - b) % 360 + 540) % 360 - 180);
@@ -842,16 +859,14 @@ function CoarseCard({ st, imu, link, live }) {
   const verified = imu?.mount?.verified === true;
   const working = !!(imu?.job && !imu.job.done && !imu.job.failed);
   const hold = st?.hold || imu?.hold || null;
-  const sampling = imu?.coarse_sampling || {};
-  const inPlace = mode === 'motion' && sampling.available && !redo.active;
-  const needsUnload = inPlace ? sampling.needs_unload !== false : !!redo.active && !!hold;
-  const captureWhy = inPlace ? sampling.reason : hold && (hold.stage !== 'holding' || !Number.isFinite(hold.max_error_deg)
+  const needsUnload = !!redo.active && !!hold;
+  const captureWhy = hold && (hold.stage !== 'holding' || !Number.isFinite(hold.max_error_deg)
     || hold.max_error_deg < 0 || hold.max_error_deg > 5)
     ? '站姿使能还未站稳：等 HOME 误差不超过 5°，再采静止或前倾' : null;
-  const canCollect = !imu?.profile_error && (inPlace || commissioning && (!redo.active || ['commissioning', 'finish_failed'].includes(redo.phase)));
+  const canCollect = !imu?.profile_error && (commissioning && (!redo.active || ['commissioning', 'finish_failed'].includes(redo.phase)));
   const showSteps = canCollect && (!verified || opened || redo.active);
   const startWhy = !open ? '连不上鸭子：等它回来' : imu?.profile_error ? imu.profile_error : working ? '上一项操作还没结束'
-    : commissioning ? null : inPlace ? sampling.reason : !redo.can_start ? redo.reason || '暂时不能返回标定模式：先卸力并等待读数更新' : null;
+    : commissioning ? null : !redo.can_start ? redo.reason || '暂时不能返回标定模式：先卸力并等待读数更新' : null;
   const run = async (op) => {
     setBusy(true); setMsg(null);
     const r = await link.cmd('imu.op', { op, confirmed: true }, 90000);
@@ -862,7 +877,7 @@ function CoarseCard({ st, imu, link, live }) {
   };
   const start = async () => {
     if (startWhy || busy) return;
-    if (commissioning || inPlace) { setMsg(null); setOpened(true); }
+    if (commissioning) { setMsg(null); setOpened(true); }
     else await run('redo-start');
   };
   return html`<section class="board imu-card imu-coarse">
@@ -870,29 +885,30 @@ function CoarseCard({ st, imu, link, live }) {
     <p class="sv-small">先采静止和前倾，计算安装方向（四元数），再由主程序验证。装法改了或上次没调对，都可以重新做。</p>
     ${imu?.mount_protocol_mismatch ? html`<p class="sv-warn">总线协议与已存安装方向不匹配：需要重新标定；主程序验证通过后才确认这份方向。</p>` : null}
     ${redo.active ? html`<p class="sv-warn">${canCollect
-      ? '本次重标定可先站姿使能、站稳后扶住采集，也可卸力托住采集。验证通过后恢复原模式；验证或取消前先失能（卸力）。'
+      ? '先站姿使能并等 HOME 稳定，采样和核验期间保持上力。核验通过后再扶稳卸力，点击保存并结束校准；取消也需要卸力。'
       : '正在切换或恢复标定会话，请等当前操作结束；如未能恢复，可以取消并恢复原参数。'}</p>
       <div class="imu-actions"><${TwoStep} label="取消并恢复原参数" ask="扶好鸭子，确认恢复原方向和模式？"
         disabled=${!open || busy || working || needsUnload}
         onConfirm=${() => run('redo-cancel')} busyLabel="正在恢复…" /></div>` : null}
     ${!showSteps && !redo.active ? html`<div class="imu-actions"><${TwoStep}
-      label="重新标定方向" ask=${inPlace ? '保持 HOME，确认采集安装方向？' : commissioning ? '扶好鸭子，确认重新采集？' : '扶好并已卸力，确认重启并进入标定模式？'}
+      label="重新标定方向" ask=${commissioning ? '扶好鸭子，确认重新采集？' : '扶好并已卸力，确认重启并进入标定模式？'}
       cls="btn-dark" disabled=${!!startWhy || busy} title=${startWhy} onConfirm=${start} busyLabel="正在进入标定模式…" /></div>
-      <p class="sv-small">${inPlace
-        ? '现在可保持 HOME 站姿，直接采静止和前倾，不用先卸力，也不重启主程序。最后验证写入前再扶稳并卸力，采好的结果会保留。'
-        : commissioning
+      <p class="sv-small">${commissioning
         ? '双手扶稳，可卸力托住，也可站姿使能后等站稳，再重新采集。'
         : '重新标定前先点「失能（卸力）」并扶住鸭子。进入和完成时会重启主程序，并备份原 IMU 方向。'}保留舵机零位、方向和限位；验证通过才采用新方向。</p>
       ${startWhy ? html`<p class="sv-warn">${startWhy}</p>` : null}` : null}
     ${captureWhy ? html`<p class="sv-warn">${captureWhy}</p>` : null}
     ${showSteps ? html`<${CoarseSteps} key=${context} link=${link} disabled=${!open || busy || working || !!captureWhy}
-      redoSession=${!!redo.active} inPlace=${!!inPlace} needsUnload=${needsUnload}
+      redoSession=${!!redo.active}
+      gravity=${st?.gravity} previewLive=${open && st?.imu?.context_current !== false
+        && Number.isFinite(st?.joints_age_ms) && st.joints_age_ms <= 250}
+      verificationPhase=${imu?.verification_phase} pendingVerification=${imu?.pending_verification}
       onBegin=${() => setOpened(true)} onDone=${(text) => setMsg({ ok: true, text })} />` : null}
     ${msg ? html`<div class=${'banner ' + (msg.ok ? 'warn' : 'bad')} role="status"><span>${msg.text}</span></div>` : null}
   </section>`;
 }
 
-function CoarseSteps({ link, disabled, redoSession, inPlace, needsUnload, onBegin, onDone }) {
+function CoarseSteps({ link, disabled, redoSession, gravity, previewLive, verificationPhase, pendingVerification, onBegin, onDone }) {
   const [step, setStep] = useState('idle');       // idle / still / fwd / confirm / verifying / done / failed
   const [still, setStill] = useState(null);
   const [res, setRes] = useState(null);
@@ -935,23 +951,39 @@ function CoarseSteps({ link, disabled, redoSession, inPlace, needsUnload, onBegi
   };
   const reset = () => { setStep('idle'); setStill(null); setRes(null); setChecks({}); setOut(null); };
   const verify = async () => {
-    if (disabled || busy || needsUnload || !res?.mount) return;
+    if (disabled || busy || !res?.mount) return;
     setBusy(true); setStep('verifying'); setOut(null);
     const r = await link.cmd('imu.op', { op: 'verify', confirmed: true, mount_wxyz: res.mount }, 90000);
     if (!alive.current) return;
-    if (r.ok) onDone(r.data?.note || '主程序验证通过，安装方向已经保存。');
+
     setBusy(false);
-    if (r.ok) { setStep('done'); setOut({ ok: true, text: (r.data && r.data.note) || '主程序验证通过，安装方向已经写进标定文件' }); }
+    if (r.ok) { setStep('checked'); setOut({ ok: true, text: r.data?.note || '核验通过，尚未保存；现在扶稳并卸力，再保存' }); }
     else { setStep('failed'); setOut({ ok: false, text: r.reason || r.error || '主程序没通过验证' }); }
+  };
+  const saveChecked = async () => {
+    if (disabled || busy || !pendingVerification || pendingVerification.needs_unload) return;
+    setBusy(true); setOut(null);
+    const r = await link.cmd('imu.op', {op:'save-verified', confirmed:true,
+      verification_id:pendingVerification.verification_id}, 90000);
+    if (!alive.current) return;
+    setBusy(false);
+    if (r.ok) { setStep('done'); onDone(r.data?.note || '已保存并结束校准'); }
+    setOut({ok:r.ok,text:r.data?.note || r.reason || r.error || '保存或模式恢复未完成'});
   };
   const confirms = (res && res.confirm) || [];
   const allChecked = confirms.every((_, i) => checks[i]);
-  const nowStep = step === 'idle' ? 'still' : step;
+  const nowStep = step === 'done' ? 'done' : pendingVerification ? 'checked' : step === 'idle' ? 'still' : step;
+  const liveCandidateTilt = previewLive ? candidateTilt(gravity, res?.correction) : null;
+  const waitingForTip = previewLive && verificationPhase === 'nose_down';
+  const cue = verificationCue(waitingForTip ? 'nose_down' : null);
+  const candidateView = html`<p class=${liveCandidateTilt != null && liveCandidateTilt > 5 ? 'sv-warn num' : 'sv-small num'}>
+    待保存新方向下的实时倾角：<b>${fmt(liveCandidateTilt)}°</b>（直立核验要求 ≤5°）。
+    ${liveCandidateTilt == null ? '等待新鲜读数；不要用页顶按已保存方向显示的倾角代替。'
+      : liveCandidateTilt > 5 ? '请回到采静止时的姿态并停稳；这与页顶按已保存方向显示的倾角不同。'
+      : '此数值按本次待保存方向换算；最终以主程序的独立核验为准。'}</p>`;
   return html`<div class="imu-coarse-steps">
-    <p class="sv-small">${inPlace
-      ? '保持 HOME、模型不要接管，直接采静止；再托住整个躯干前倾采数。采数不卸力、不切换模式。最后验证写入前，再扶稳并卸力。'
-      : redoSession
-      ? '本次重标定可先点「站姿使能」，等站稳后扶住采集；也可失能（卸力）后托住采集。交给主程序验证或取消前，再先失能（卸力）。'
+    <p class="sv-small">${redoSession
+      ? '先点「站姿使能」，等 HOME 稳定后采样并核验，期间保持上力；核验通过后再卸力保存。'
       : '粗校在标定模式做：可先点「站姿使能」，等站稳后双手扶住；也可失能（卸力）后双手托住。站姿使能只锁住关节，需要一直扶稳。'}
       先把整个鸭子摆正、别动，采 3 秒；再让整个躯干前倾 15–30° 停住，采 3 秒；电脑算出方向，再交给主程序自己验一遍。</p>
     ${nowStep === 'still' ? html`<div class="imu-coarse-step">
@@ -976,19 +1008,33 @@ function CoarseSteps({ link, disabled, redoSession, inPlace, needsUnload, onBegi
         <div><span>总改变量</span><b>${fmt(res.parts?.total_deg)}°</b><small>相对原安装方向</small></div>
       </div>
       <p class="sv-small">静止时躯干姿态的偏差也会折入安装方向；这些修正量同时包含参考姿态偏差和安装偏差，采静止时要以实物摆正为准。</p>
+      ${candidateView}
       ${(res.notes || []).map((n) => html`<p class="sv-small">· ${n}</p>`)}
       ${confirms.map((c, i) => html`<label class="imu-confirm"><input type="checkbox" checked=${!!checks[i]}
         onChange=${(e) => setChecks({ ...checks, [i]: e.target.checked })} /> ${c}</label>`)}
       <div class="imu-actions">
-        <button class="btn-dark" disabled=${busy || disabled || needsUnload || !res.mount || !allChecked} onClick=${verify}>交给主程序验证</button>
+        <button class="btn-dark" disabled=${busy || disabled || !res.mount || !allChecked} onClick=${verify}>交给主程序验证</button>
         <button class="btn-light" disabled=${busy} onClick=${reset}>重做</button>
       </div>
-      ${redoSession || inPlace ? html`<p class=${needsUnload ? 'sv-warn' : 'sv-small'}>先扶稳并点「失能（卸力）」，已采集和求解的结果会保留。${inPlace ? '点击验证后才备份原方向并切换模式；' : ''}验证通过后恢复原运行模式。</p>` : null}
-      <p class="sv-small"><b>点击验证前，先把实物回正并停住。</b>点了以后，再按提示在 20 秒内往前倾 15–30° 并停住。</p>
+      <p class="sv-small">此步只核验，不保存、不重启；可以保持 HOME 上力。核验通过后再卸力并保存。</p>
+      <p class="sv-small"><b>保持 HOME，回到采静止时的姿态，再点击验证。</b>点击后继续保持直立，等主程序确认直立通过，再前倾。</p>
     </div>` : null}
     ${nowStep === 'verifying' ? html`<div class="imu-coarse-step">
-      <p class="imu-say"><b>按主程序提示，在 20 秒内往前倾 15–30°</b></p>
-      <p class="sv-small">保持双手托住。主程序会先检查摆正，再检查前倾；验证成功后会保存，重标定会话还需等原模式恢复完毕。</p>
+      <p class="imu-say"><b>${cue.title}</b></p>
+      <p class="sv-small">${cue.detail}</p>
+      ${!waitingForTip ? candidateView : null}
+      <p class="sv-small">这一步不写入标定；核验通过后会出现独立的「保存并结束校准」按钮。</p>
+    </div>` : null}
+    ${nowStep === 'checked' ? html`<div class="imu-coarse-step">
+      <p class="imu-say"><b>${pendingVerification?.saved ? '已保存，等待模式恢复' : '核验通过，尚未保存'}</b></p>
+      <p class="sv-small">现在把躯干回正并扶稳，点击「失能（卸力）」。已通过的核验结果会保留，不需要再手托着重复核验。</p>
+      ${pendingVerification ? html`<p class="sv-small">${pendingVerification.saved ? '保存已经确认；可重试完成模式恢复。'
+        : `核验结果还剩 ${pendingVerification.expires_in_seconds} 秒有效。`}</p>`
+        : html`<p class="sv-warn">等待读回有效核验凭据；若已过期或主程序重启，请重新核验。</p>`}
+      <button class="btn-dark" disabled=${busy || disabled || !pendingVerification || pendingVerification.needs_unload}
+        onClick=${saveChecked}>${busy ? '正在保存并恢复…' : pendingVerification?.saved ? '完成模式恢复' : '保存并结束校准'}</button>
+      ${pendingVerification?.needs_unload ? html`<p class="sv-warn">先扶稳并卸力；无需再次采样或核验。</p>` : null}
+      ${!pendingVerification ? html`<button class="btn-light" disabled=${busy} onClick=${reset}>重新采样</button>` : null}
     </div>` : null}
     ${nowStep === 'done' ? html`<p class="sv-small">主程序验证通过，方向已经写进标定文件。下面「站着校准」还可以再精校一次。</p>` : null}
     ${nowStep === 'failed' ? html`<div class="imu-actions">
@@ -1015,7 +1061,7 @@ function JobBanner({ job }) {
 
 // 给测试用（不接浏览器也能喂一串读数，看采集怎么走）
 export const _test = { RULES, STEPS, TILTS, feed, freshWizard, startCollect, endCollect, resumeCollect, redoSteps,
-  missingSteps, payload, findHold, findRef, spreadP90, tiltOf, qRotate };
+  missingSteps, payload, findHold, findRef, spreadP90, tiltOf, qRotate, candidateTilt, verificationCue };
 
 // ---------------- 页面 ----------------
 
@@ -1081,7 +1127,7 @@ export function ImuPage({ st, imu, link, live, age, diagnosticElapsed = 0, pd })
       <h1>IMU</h1>
       <span class="sv-metrics num">
         <span>方向 <b>${S.word}</b></span>
-        <span>倾角 <b>${fmt(st?.tilt_deg)}°</b>${F.live ? '' : `（${F.text}）`}</span>
+        <span>倾角 <b>${fmt(st?.tilt_deg)}°</b>（已保存方向）${F.live ? '' : `（${F.text}）`}</span>
         <span>芯片 <b>${chipLabel(imu, live, diagnosticElapsed)}</b></span>
       </span>
     </header>

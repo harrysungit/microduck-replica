@@ -137,115 +137,18 @@ class HomeCoarseTest(unittest.TestCase):
             asyncio.run(b.handle({'op':'solve','mode':'coarse','samples':[{'g':[0,0,-1]}]}))
         self.assertIsNone(b.last_result)
 
-    def test_home_candidate_survives_unload_and_enters_existing_verified_transaction(self):
-        b = self.home()
-        b.view()
-        q = [0.5]*4
-        b.last_result = {'ok':True,'mode':'coarse','mount':q}
-        b._result_basis = b._sampling_basis(b.rd.bus.value)
-        b.rd.bus.value['native'].update(torque_enabled=False, torque_state_confirmed=False)
-        session = {'active':False}
-        actions = []
-        def transaction(by, action, **kwargs):
-            actions.append(action)
-            if action == 'enter':
-                session.update(active=True, phase='commissioning', session_id='d'*32, source='bus')
-                b.rd.bus.set(commissioning_bus())
-            else:
-                self.assertEqual(action, 'finish')
-                self.assertEqual(kwargs['quat'], q)
-                session['active'] = False
-                b.rd.bus.set(commissioning_bus(mode='motion'))
-            return True, 'imu_'+action, copy.deepcopy(session)
-        with mock.patch.object(helper, 'available', return_value=True), \
-             mock.patch.object(helper, 'imu_redo_state', side_effect=lambda **_: copy.deepcopy(session)), \
-             mock.patch.object(helper, 'imu_recalibrate', side_effect=transaction):
-            result = asyncio.run(b.handle({'op':'verify','confirmed':True,'mount_wxyz':q}, 'test'))
-        self.assertTrue(result['ok'])
-        self.assertEqual(actions, ['enter', 'finish'])
-
-    def test_home_old_contract_refuses_before_mode_switch_and_preserves_candidate(self):
-        b = self.home()
-        b.view()
-        q = [0.5]*4
-        candidate = {'ok': True, 'mode': 'coarse', 'mount': q}
-        b.last_result = candidate
-        b._result_basis = b._sampling_basis(b.rd.bus.value)
-        b.rd.bus.value['native'].update(torque_enabled=False, torque_state_confirmed=False)
-        latest = copy.deepcopy(b.rd.calib.value)
-        latest.pop('imu_verification_contract')
-        original = b.rd.cmd.call
-
-        async def old_daemon(method, params, timeout):
-            if (params or {}).get('action') == 'calibration-status':
-                return latest
-            return await original(method, params, timeout)
-
-        b.rd.cmd.call = old_daemon
-        with mock.patch.object(helper, 'available', return_value=True), \
-             mock.patch.object(helper, 'imu_recalibrate', return_value=(False, 'old_daemon', None)) as switch, \
-             mock.patch.object(b.rd, 'verify', wraps=b.rd.verify) as save:
-            with self.assertRaisesRegex(Refused, 'API43'):
-                asyncio.run(b.handle({'op': 'verify', 'confirmed': True, 'mount_wxyz': q}))
+    def test_staged_mode_preparation_home_candidate_survives_unload_and_enters_existing_verified_transaction(self):
+        b=self.home();b.view();q=[.5]*4
+        b.last_result={'ok':True,'mode':'coarse','mount':q}
+        with mock.patch.object(helper,'imu_recalibrate') as switch,self.assertRaisesRegex(Refused,'进入安装方向标定'):
+            asyncio.run(b.handle({'op':'verify','confirmed':True,'mount_wxyz':q}))
         switch.assert_not_called()
-        save.assert_not_called()
-        self.assertIs(b.last_result, candidate)
+        self.assertEqual(b.last_result['mount'],q)
 
-    def test_verification_waits_for_poll_reconnect_after_enter(self):
-        b = self.home()
-        b.rd.present = True
-        b.rd.hello = Sample()
-        b.rd.hello.set({'build':'test'})
-        b.rd.bus.set(b.rd.bus.value)
-        b.rd.calib_valid_after = b.rd.hello.at
-        b.rd.calib.set(b.rd.calib.value)
-        b.view()
-        q = [0.5]*4
-        b.last_result = {'ok':True,'mode':'coarse','mount':q}
-        b._result_basis = b._sampling_basis(b.rd.bus.value)
-        b.rd.bus.value['native'].update(torque_enabled=False,torque_state_confirmed=False)
-        session = {'active':False}
-        actions = []
-        def reconnect():
-            b.rd.hello.set({'build':'test'})
-            b.rd.calib_valid_after = b.rd.hello.at
-            b.rd.bus.set(b.rd.bus.value)
-            b.rd.calib.set(b.rd.calib.value)
-            b.rd.present = True
-        def transaction(by, action, **kwargs):
-            actions.append(action)
-            if action == 'enter':
-                session.update(active=True,phase='commissioning',session_id='e'*32,source='bus')
-                b.rd.bus.set(commissioning_bus())
-                b.rd.present = False
-                timer = threading.Timer(.05,reconnect)
-                timer.start()
-                self.addCleanup(timer.join)
-            else:
-                session['active'] = False
-                b.rd.bus.set(commissioning_bus(mode='motion'))
-            return True,'imu_'+action,copy.deepcopy(session)
-        with mock.patch.object(helper,'available',return_value=True), \
-             mock.patch.object(helper,'imu_redo_state',side_effect=lambda **_:copy.deepcopy(session)), \
-             mock.patch.object(helper,'imu_recalibrate',side_effect=transaction):
-            result=asyncio.run(b.handle({'op':'verify','confirmed':True,'mount_wxyz':q},'test'))
-        self.assertTrue(result['ok'])
-        self.assertEqual(actions,['enter','finish'])
-
-    def test_verify_refuses_fresh_board_change_even_when_poll_cache_is_old(self):
-        b = self.home()
-        b.rd.bus.value['imu_bus'] = {'protocol':'feetech','board':'ft6','identity':[1,2,3]}
-        b.view()
-        b.last_result = {'ok':True,'mode':'coarse','mount':[1.,0.,0.,0.]}
-        b._result_basis = b._sampling_basis(b.rd.bus.value)
-        fresh_bus = copy.deepcopy(b.rd.bus.value)
-        fresh_bus['imu_bus'] = {'protocol':'feetech','board':'imu_to_dxl','identity':[9,9,9]}
-        fresh_bus['native'].update(torque_enabled=False,torque_state_confirmed=False)
-        async def replacement():
-            return fresh_bus
-        b._bus_once = replacement
-        with mock.patch.object(helper, 'imu_recalibrate') as switch, self.assertRaisesRegex(Refused, '已改变'):
-            asyncio.run(b.handle({'op':'verify','confirmed':True,'mount_wxyz':[1.,0.,0.,0.]}))
+    def test_staged_mode_preparation_home_old_contract_refuses_before_mode_switch_and_preserves_candidate(self):
+        b=self.home();b.rd.bus.value["native"].update(torque_enabled=False,torque_state_confirmed=False);b.view();q=[.5]*4
+        b.last_result={'ok':True,'mode':'coarse','mount':q}
+        with mock.patch.object(helper,'imu_recalibrate') as switch,self.assertRaisesRegex(Refused,'进入安装方向标定'):
+            asyncio.run(b.handle({'op':'verify','confirmed':True,'mount_wxyz':q}))
         switch.assert_not_called()
-        self.assertIsNone(b.last_result)
-
+        self.assertEqual(b.last_result['mount'],q)

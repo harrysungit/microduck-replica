@@ -265,44 +265,17 @@ try {
   await wait(`document.querySelector('#main-imu').textContent==='ft6'`, 'Main prior daemon control identity');
   await js(`mainListener({...controlState,imu:{...controlState.imu,context_current:false,generation:100.1}})`);
   await wait(`document.querySelector('#main-imu').textContent==='unknown'`, 'Main new hello clears same-phase prior daemon identity');
-  // The actual reported entry is motion/HOME with torque already enabled.
-  // It must expose collection in place, without sending redo-start or relax.
+  // Mode preparation is explicit and happens before sampling, never between check and save.
   await js(`window.calls=[];window.replies=[];
     props.st={mode:'motion',posture:'holding',gravity:[0,0,-1],joints_age_ms:5,imu:{status:'ok'},hold:null};
     props.imu={source:'bus',mode:'motion',mount:{quat:[1,0,0,0],verified:true},
       imu_bus:{protocol:'feetech',board:'imu_to_dxl',identity:[1,1,0,68,77]},
       coarse_sampling:{available:true,reason:null,needs_unload:true},
-      redo:{can_start:false,reason:'先扶稳并卸力，等主程序确认全部失能'}};
-    props.live=true;draw()`);
-  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='重新标定方向'&&!b.disabled)`, 'motion HOME installation entry enabled');
-  await js(`clickText('重新标定方向')`);
-  await pause(750);
-  await js(`clickText('保持 HOME，确认采集安装方向？')`);
-  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='采静止（3 秒）'&&!b.disabled)`, 'motion HOME can collect still');
-  assert.equal(await js(`calls.length`),0, 'opening collection never changes mode or torque');
-  await js(`clickText('采静止（3 秒）')`);
-  await wait(`calls.length===1`, 'motion HOME still request');
-  assert.deepEqual(await js(`calls[0]`),{name:'imu.op',args:{op:'coarse-capture',phase:'still',seconds:3}});
-  await js(`replies.shift()({ok:true,data:{n:30,samples:[{step:'still',g:[0,0,-1]}]}})`);
-  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='采前倾（3 秒）'&&!b.disabled)`, 'motion HOME forward follows still');
-  await js(`clickText('采前倾（3 秒）')`);
-  await wait(`calls.length===2`, 'motion HOME forward request');
-  await js(`replies.shift()({ok:true,data:{n:30,samples:[{step:'fwd',g:[.34,0,-.94]}]}})`);
-  await wait(`calls.length===3`, 'motion HOME solve request');
-  await js(`replies.shift()({ok:true,data:{ok:true,mount:[1,0,0,0],confirm:[],notes:[],
-    parts:{pitch_deg:8.6,roll_deg:-2.4,total_deg:24.8}}})`);
-  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='交给主程序验证'&&b.disabled)`, 'motion HOME final write requires unload');
-  assert.equal(await js(`!!document.querySelector('.imu-coarse .imu-parts')`), true, 'coarse confirmation shows correction angles');
-  const correction = await js(`document.querySelector('.imu-coarse .imu-parts').innerText`);
-  assert.match(correction, /俯仰[\s\S]*\+8\.6°/);
-  assert.match(correction, /横滚[\s\S]*-2\.4°/);
-  assert.match(correction, /总改变量[\s\S]*24\.8°/);
-  assert.match(await js(`document.querySelector('.imu-coarse').innerText`), /静止时躯干姿态.*折入.*安装方向/);
-  await js(`props.imu={...props.imu,coarse_sampling:{...props.imu.coarse_sampling,needs_unload:false}};draw()`);
-  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='交给主程序验证'&&!b.disabled)`, 'motion HOME unload preserves solved candidate');
-  assert.equal(await js(`calls.some(c=>c.args.op==='redo-start'||c.name==='relax'||c.args.op==='verify')`),false);
+      redo:{can_start:false,reason:'先扶稳并卸力，进入标定后保持 HOME 采样核验'}};props.live=true;draw()`);
+  await wait(`[...document.querySelectorAll('.imu-coarse button')].some(b=>b.textContent.trim()==='重新标定方向'&&b.disabled)`, 'prepare mode before capture');
+  assert.equal(await js('calls.length'),0,'no automatic relax or mode switch');
   // A persisted redo session may hold HOME for sampling, but must unload before
-  // final verification/cancellation. Unloading must keep the solved samples.
+  // save/cancellation only. Verification remains enabled during a settled HOME hold.
   await js(`window.calls=[];window.replies=[];window.confirm=()=>true;
     props.st={mode:'commissioning',posture:'commissioning',gravity:[0,0,-1],joints_age_ms:5,imu:{status:'ok'},hold:null};
     props.imu={source:'bus',mode:'commissioning',mount:{quat:[1,0,0,0],verified:true},hold:null,
@@ -327,13 +300,32 @@ try {
   await wait(`calls.some(c=>c.args.op==='coarse-capture'&&c.args.phase==='fwd')`, 'held forward capture');
   await js(`replies.shift()({ok:true,data:{n:30,samples:[{step:'fwd',g:[0.34,0,-0.94]}]}})`);
   await wait(`calls.some(c=>c.args.op==='solve')`, 'held samples solved');
-  await js(`replies.shift()({ok:true,data:{ok:true,mount:[1,0,0,0],confirm:[],notes:[],quality:{grade:'coarse'}}})`);
-  await wait(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='交给主程序验证'&&b.disabled)`, 'redo verification requires unloading');
-  assert.match(await js(`document.querySelector('.imu-coarse').innerText`), /卸力/);
-  await js(`props.st={...props.st,hold:null};props.imu={...props.imu,hold:null};draw()`);
-  await wait(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='交给主程序验证'&&!b.disabled)`, 'unloading preserves the solved candidate');
+  await js(`replies.shift()({ok:true,data:{ok:true,mount:[Math.cos(2.02*Math.PI/180),0,-Math.sin(2.02*Math.PI/180),0],
+    correction:[Math.cos(2.02*Math.PI/180),0,-Math.sin(2.02*Math.PI/180),0],confirm:[],notes:[],quality:{grade:'coarse'}}});
+    props.st={...props.st,gravity:[Math.sin(3.25*Math.PI/180),0,-Math.cos(3.25*Math.PI/180)],tilt_deg:3.25};draw()`);
+  await wait(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='交给主程序验证'&&!b.disabled)`, 'held HOME permits verification');
+  assert.match(await js(`document.querySelector('.imu-coarse').innerText`), /待保存新方向下的实时倾角：[\s\S]*7\.3°/);
+  assert.match(await js(`document.querySelector('.sv-metrics').innerText`), /3\.3°.*已保存方向/);
+  await js(`clickText('交给主程序验证')`);
+  await wait(`calls.some(c=>c.args.op==='verify')`, 'explicit verification request');
+  await wait(`document.querySelector('.imu-coarse').innerText.includes('保持直立，暂不要前倾')`, 'wait for upright instead of premature tipping');
+  await js(`props.imu={...props.imu,verification_phase:'nose_down'};draw()`);
+  await wait(`document.querySelector('.imu-coarse').innerText.includes('直立已通过：现在将躯干前倾')`, 'real native phase enables tip cue');
+  await js(`props.imu={...props.imu,pending_verification:{verification_id:'native-proof',saved:false,needs_unload:true,expires_in_seconds:299}};
+    replies.shift()({ok:true,data:{verified:true,saved:false,verification_id:'native-proof',note:'核验通过，尚未保存'}});draw()`);
+  await wait(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='保存并结束校准'&&b.disabled)`, 'save requires unloading, not verification');
+  assert.equal(await js(`calls.some(c=>c.args.op==='save-verified')`),false,'check never auto-saves');
+  assert.equal(await js(`calls.some(c=>c.name==='relax')`),false,'no automatic actuator command');
+  await js(`props.st={...props.st,hold:null};props.imu={...props.imu,hold:null,
+    pending_verification:{...props.imu.pending_verification,needs_unload:false}};draw()`);
+  await wait(`[...document.querySelectorAll('button')].some(b=>b.textContent.trim()==='保存并结束校准'&&!b.disabled)`, 'unloading keeps the proof without recapture');
+  await js(`clickText('保存并结束校准')`);
+  await wait(`calls.some(c=>c.args.op==='save-verified')`, 'explicit save');
+  assert.deepEqual(await js(`calls.find(c=>c.args.op==='save-verified').args`),{op:'save-verified',confirmed:true,verification_id:'native-proof'});
   assert.equal(await js(`calls.filter(c=>c.args.op==='coarse-capture').length`),2);
-  assert.equal(await js(`calls.some(c=>c.args.op==='verify')`),false, 'UI never auto-verifies or auto-relaxes');
+  assert.equal(await js(`calls.filter(c=>c.args.op==='verify').length`),1,'no second check after relax');
+  await js(`props.imu={...props.imu,pending_verification:null};replies.shift()({ok:true,data:{saved:true,note:'已保存并结束校准'}});draw()`);
+  await wait(`document.querySelector('.imu-coarse').innerText.includes('已保存并结束校准')`, 'save completed');
   assert.deepEqual(errors, []);
   process.stdout.write('IMU bus browser assertions passed\n');
 } finally {

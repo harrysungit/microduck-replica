@@ -23,8 +23,8 @@ from .log import log_cmd
 from .rpc import Conn, RpcError, Timeout, Unreachable, call_once, encode, open_conn, read_message
 from .startup import StartupTrack, startup_loop
 
-API_VERSION = 42                     # duck-ipc-proto；不一致只记日志，不拒绝
-KNOWN_BUILDS = ("1fa8438-feetech-ft6-control.43", "4734cbb-feetech-imu-auto-control.44",
+API_VERSION = 44                     # duck-ipc-proto；不一致只记日志，不拒绝
+KNOWN_BUILDS = ("harry-imu-staged-control.49", "replica-imu-verify-control.48", "1fa8438-feetech-ft6-control.43", "4734cbb-feetech-imu-auto-control.44",
                 "0791fcd-feetech-qinmo-control.45", "0791fcd-feetech-qinmo-control.46",
                 "0791fcd-feetech-qinmo-control.47")
 BACKOFF = (0.5, 1.0, 2.0, 5.0)

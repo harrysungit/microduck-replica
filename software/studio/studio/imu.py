@@ -6,7 +6,7 @@
 
 完整站着校完、结果 ok 的那一份记进 state 目录的 imu-pending.json（Studio 重启也不丢），最后由上手清单
 的「写进主程序」一次写进 robotd。出厂镜像跑标定模式：粗校从 busStatus.last_sample.imu 采静止和前倾，
-算完直接交给主程序的 verify-imu（摆正 ≤5°，20 秒内往前低头 15–30°），主程序自己写标定文件。
+算完交给主程序 check-imu（摆正 ≤5°，20 秒内前倾 15–30°）；保持 HOME 核验后，再明确卸力并保存。
 总线板卡由主程序启动时自动识别；I²C 芯片检测仍用 microduck-firstboot。
 """
 import asyncio
@@ -28,6 +28,7 @@ ON_DUCK = ("总线 ID 200 的 IMU 由主程序启动时自动识别。I²C IMU �
 # （5° 是 imu_calib RULES 的 stand_confirm_deg：robotd 自己验方向时直立只放 5°）
 CHECK_MAX_DIFF_DEG = 2.0
 IMU_VERIFICATION_CONTRACT = "upright_nose_down_v1"
+IMU_STAGED_VERIFICATION_CONTRACT = "check_then_relax_save_v1"
 
 
 class Refused(Exception):
@@ -161,6 +162,7 @@ class ImuBackend:
         self._verify_lock = asyncio.Lock()
         self.job = None              # 粗校采数 / 交给主程序验证的进度
         self.detected = None         # 最近一次识别芯片的结果（这一步还没有）
+        self._pending_verification = None
         self.last_result = None      # 最近一次 solve 的结果：写入只认这一份
         # 总览上手清单的「IMU 核对过」记录（审查 O4）：app 接上 Onboarding.note_imu_check。不是写入鸭子：写入照旧要上鸭子再接
         self.on_check = None
@@ -188,11 +190,25 @@ class ImuBackend:
             if context[1] != self._seen_context[1] and self.job and (self.job.get("done") or self.job.get("failed")):
                 self.job = None
         self._seen_context = context
+        pending = self._pending_verification
+        if pending and (not current or context != pending["context"] or (not pending.get("native_saved") and time.monotonic() >= pending["deadline"])
+                        or getattr(getattr(self.rd, "hello", None), "at", None) != pending["daemon_generation"]):
+            self._pending_verification = None
+            pending = None
         ls = bus.get("last_sample") if isinstance(bus.get("last_sample"), dict) else {}
         s_imu = ls.get("imu") if isinstance(ls.get("imu"), dict) else {}
         reader = native.get("imu_reader")
         if reader is None and bus.get("mode") == "commissioning":
             reader = {"state": ("streaming" if s_imu.get("ready") else "missing"), "errors": 0}
+        # robotd publishes this only AFTER the upright check has passed.
+        verification_phase = ("nose_down" if bus.get("mode") == "commissioning"
+                              and isinstance(bus.get("imu_verification"), str)
+                              and bus["imu_verification"] else None)
+        job = self.job
+        if job and job.get("title") == "交给主程序验证" and not job.get("done") and not job.get("failed"):
+            job = {**job, "title": "直立已通过：现在前倾" if verification_phase else "保持直立，等待主程序检查",
+                   "msg": "现在将整个躯干前倾 15–30° 并停住，20 秒内完成" if verification_phase
+                   else "先保持采静止时的姿态，暂不要前倾；等提示「直立已通过」再动"}
         return {
             "t": "imu", "mode": bus.get("mode"), "source": source, "chip_setting": None, "mount": mount,
             "diagnostic": imu_diagnostic(self.rd),
@@ -206,7 +222,13 @@ class ImuBackend:
             "ready": native.get("imu_ready", s_imu.get("ready")),
             "valid": s_imu.get("valid"), "gravity": s_imu.get("gravity"),
             "hold": bus.get("hold") if isinstance(bus.get("hold"), dict) else None,
-            "detected": self.detected, "stand_calib_at": self._stand_calib_at(), "job": self.job,
+            "detected": self.detected, "stand_calib_at": self._stand_calib_at(), "job": job,
+            "verification_phase": verification_phase,
+            "pending_verification": ({"verification_id": pending["verification_id"],
+                "saved": pending.get("native_saved", False),
+                "needs_unload": (bus.get("torque_state") != "off" or bool(bus.get("hold"))
+                    or bool(bus.get("power_pending")) or bus.get("torque_off_pending") not in (None,False)),
+                "expires_in_seconds": max(0, int(pending["deadline"]-time.monotonic()))} if pending else None),
             "redo": redo,
             "coarse_sampling": self._motion_sampling(bus, source, redo),
         }
@@ -588,12 +610,10 @@ class ImuBackend:
             self._redo_busy = False
 
     async def _require_verification_contract(self, source):
-        if source != "bus":
-            return
         status = await self._rpc_once("robot.busCommand", {"action": "calibration-status"},
-                                      5.0, "核对独立 IMU 核验能力")
-        if not isinstance(status, dict) or status.get("imu_verification_contract") != IMU_VERIFICATION_CONTRACT:
-            raise Refused("当前主程序不支持 ID200 独立直立 / 前倾核验：请安装 API43 配套主程序后重新验证。未发送验证或保存请求")
+                                      5.0, "核对分阶段 IMU 核验能力")
+        if not isinstance(status, dict) or status.get("imu_staged_verification_contract") != IMU_STAGED_VERIFICATION_CONTRACT:
+            raise Refused("当前主程序不支持保持 HOME 核验、卸力后单独保存：请安装 API44 配套主程序。未发送核验或保存请求")
 
     @staticmethod
     def _require_verification_proof(reply, source):
@@ -607,136 +627,99 @@ class ImuBackend:
                 or any(not isinstance(x, (int, float)) or isinstance(x, bool) or not math.isfinite(x)
                        for x in (residual, tilt, heading))
                 or not 0 <= residual <= 5 or tilt < 12 or abs(heading) > 20):
-            raise Refused("主程序未返回有效的独立直立 / 前倾核验结果：来源须一致、直立残差须在 0–5°、前倾须 ≥12°、朝前误差须 ≤20°。不能确认通过，请检查 API43 配套主程序后重新核验")
+            raise Refused("主程序未返回有效的独立直立 / 前倾核验结果：来源须一致、直立残差须在 0–5°、前倾须 ≥12°、朝前误差须 ≤20°。不能确认通过，请检查 API44 配套主程序后重新核验")
 
     async def _verify(self, args, by=None):
         bus = await self._bus_once()
-        if bus.get("mode") == "motion":
-            return await self._verify_from_home(bus, args, by)
         if bus.get("mode") != "commissioning":
-            raise Refused("主程序已经在运动模式：站起来以后用站着校准")
+            raise Refused("先扶稳并卸力，进入安装方向标定，再点站姿使能；此后采数和核验可以一直保持 HOME")
         redo = self._coarse_guard(bus)
-        if redo.get("active") and (bus.get("torque_state") != "off" or bus.get("hold")):
-            raise Refused("重标采数可以保持站姿；交给主程序验证前，请扶稳并先点「失能（卸力）」。已采集结果会保留")
-        self.view()  # invalidate a result from a different mode/source/session before consuming it
+        self.view()
         source, _ = mount_of(bus, fresh_calib(self.rd))
         context = calibration_context(bus, source, redo)
-        generation = self._context_generation
-        verified_info = bus_imu_of(bus)
-        verified_bus = {"imu_bus": verified_info} if verified_info is not None else {}
-        if self._seen_context != context:
-            self.last_result = None
         mount = args.get("mount_wxyz") or args.get("mount")
-        if args.get("confirmed") is not True or not isinstance(mount, list) or len(mount) != 4:
-            raise Refused("要先对照模块实际装法勾选确认，再交给主程序验证")
         last = self.last_result if isinstance(self.last_result, dict) else {}
-        if not last.get("ok") or last.get("mode") != "coarse" or last.get("mount") != mount:
-            raise Refused("这份方向不是刚刚粗校算出来的：重新算一次再验证")
+        if (args.get("confirmed") is not True or not isinstance(mount, list) or len(mount) != 4
+                or not last.get("ok") or last.get("mode") != "coarse" or last.get("mount") != mount):
+            raise Refused("先重新采静止和前倾、计算方向并勾选确认，再交给主程序核验")
         await self._require_verification_contract(source)
+        self._pending_verification = None
+        generation = self._context_generation
+        daemon_generation = getattr(getattr(self.rd, "hello", None), "at", None)
         self.job = {"kind": "coarse", "title": "交给主程序验证",
-                    "msg": "摆正，然后 20 秒内往前低头 15–30°", "target_deg": 20}
+                    "msg": "保持 HOME 和直立；等主程序确认后再前倾。本步不保存"}
         try:
-            # fork 的 command_timeout 是 20 秒窗口 + 10 秒；再加 5 秒余量
-            r = await self._rpc_once("robot.busCommand",
-                                     {"action": "verify-imu", "confirmed": True, "mount_wxyz": mount},
-                                     35.0, "验证 IMU 方向")
-        except (RpcError, Timeout, Unreachable) as e:
-            msg = self._translate_verify_error(e)
-            self.job = {"kind": "coarse", "title": "主程序验证没通过", "failed": True, "msg": msg,
-                        "raw": getattr(e, "message", None) or str(e)}
-            self.log.warn(f"IMU 粗校验证没通过：{msg}", cat="IMU", raw=str(e),
-                          ctx={"by": by, "source": self.view().get("source")})
-            raise Refused(msg) from e
-        # A verifier reply alone is not success: read the exact active source and normalized mount back.
-        try:
-            self._require_verification_proof(r, source)
-            status = await self._verified_readback(source, mount, transport=context[1], generation=generation)
-            current_redo = helper.imu_redo_state(root=self.root)
-            if redo.get("active"):
-                if not current_redo.get("active") or current_redo.get("session_id") != redo.get("session_id"):
-                    raise Refused("IMU 验证后重做会话已改变：没有完成切回运动模式")
-                ok, result, detail = await asyncio.to_thread(
-                    helper.imu_recalibrate, by or "Studio", "finish", session_id=redo["session_id"],
-                    source=source, quat=self._normalized_quat(mount))
-                if not ok:
-                    raise Refused(helper.friendly(result, detail, "imu-recalibrate"))
-                status = await self._verified_readback(source, mount,
-                    motion=redo.get("original_mode") != "commissioning", transport=context[1])
-            elif current_redo.get("active"):
-                raise Refused("IMU 验证期间出现另一份重做会话：未完成")
-            from .commit import clear_pending, load_pending, pending_matches
-            pending = load_pending(self.state_dir)
-            if pending and not pending_matches(pending, source, verified_bus):
-                try:
-                    clear_pending(self.state_dir)
-                except OSError as err:
-                    raise Refused("主程序已验证安装方向，但旧站姿校准结果没能清理：重新做站着校准后再写进主程序") from err
-        except (RpcError, Timeout, Unreachable, Refused) as err:
-            msg = str(err) if isinstance(err, Refused) else f"主程序验证回包后，标定没读回确认：{err}"
-            self.job = {"kind": "coarse", "title": "IMU 独立核验或标定读回未确认", "failed": True, "msg": msg}
-            self.last_result = None
-            raise Refused(msg) from err
-        self.last_result = None
-        self.job = {"kind": "coarse", "title": "主程序验证通过", "done": True,
-                    "msg": "已经写进标定文件，IMU 方向已确认"}
-        self.log.info("IMU 粗校验证通过：主程序已把安装方向写进标定文件", cat="IMU",
-                      ctx={"by": by, "source": self.view().get("source"), "mount": mount})
-        return {"ok": True, "note": "主程序验证通过，安装方向已经写进标定文件", "reply": r, "calibration": status}
-
-    async def _verify_from_home(self, bus, args, by):
-        """Handoff the collected candidate only after the user manually unloads."""
-        self._coarse_guard(bus)
-        self.view()
-        mount = args.get("mount_wxyz") or args.get("mount")
-        last = self.last_result
-        if (args.get("confirmed") is not True or not isinstance(last, dict) or not last.get("ok")
-                or last.get("mode") != "coarse" or last.get("mount") != mount):
-            raise Refused("这份方向不是刚刚粗校算出来的：重新采数并确认后再验证")
-        if self._result_basis != self._sampling_basis(bus):
-            self.last_result = None
-            raise Refused("实时读回的 IMU 来源、板卡、原方向或连接已改变：重新采静止和前倾")
-        source, old_mount = mount_of(bus, fresh_calib(self.rd))
-        if self._motion_sampling(bus, source, {})["needs_unload"]:
-            raise Refused("静止和前倾可以保持 HOME 采集；验证写入前先扶稳并卸力，已采结果会保留")
-        await self._require_verification_contract(source)
-        if not helper.available():
-            raise Refused("验证写入需要新版 root 小助手和 sudoers")
-        transport = calibration_context(bus, source, {})[1]
-        basis = self._sampling_basis(bus)
-        self._redo_busy = True
-        self.job = {"kind": "coarse", "title": "进入安装方向验证", "msg": "已采结果保留；备份原方向并切换验证模式"}
-        try:
-            ok, result, detail = await asyncio.to_thread(helper.imu_recalibrate, by or "Studio", "enter", confirmed=True)
-            if not ok:
-                raise Refused(helper.friendly(result, detail, "imu-recalibrate"))
-            deadline = time.monotonic() + 8
-            while hasattr(self.rd, "present") and self.rd.present is not True:
-                if time.monotonic() >= deadline:
-                    raise Refused("验证模式已进入，等待网页重新连上主程序后再继续")
-                await asyncio.sleep(.1)
+            reply = await self._rpc_once("robot.busCommand",
+                {"action": "check-imu", "confirmed": True, "mount_wxyz": mount}, 35.0, "独立核验 IMU 方向（不保存）")
+            self._require_verification_proof(reply, source)
+            token = reply.get("verification_id") if isinstance(reply, dict) else None
+            if (reply.get("verified") is not True or reply.get("saved") is not False
+                    or not isinstance(token, str) or not 1 <= len(token) <= 128
+                    or type(reply.get("expires_in_seconds")) not in (int,float)
+                    or not math.isfinite(reply["expires_in_seconds"]) or not 0 < reply["expires_in_seconds"] <= 300):
+                raise Refused("主程序未返回有效的只读核验凭据；没有请求保存")
+            echoed = self._normalized_quat(reply.get("mount_wxyz"))
+            if any(not math.isclose(a,b,abs_tol=1e-8,rel_tol=0) for a,b in zip(echoed,self._normalized_quat(mount))):
+                raise Refused("核验凭据中的候选方向不一致；没有请求保存")
             current = await self._bus_once()
-            status = await self._rpc_once("robot.busCommand", {"action": "calibration-status"}, 5.0, "核对验证前原方向")
-            now_source, now_mount = mount_of(current, status)
-            if (current.get("mode") != "commissioning" or now_source != source or now_mount != old_mount
-                    or calibration_context(current, source, {})[1] != transport):
-                self.last_result = None
-                raise Refused("切换验证模式后 IMU 来源、板卡或原方向不一致：停止写入，重新采数")
-            self.rd.bus.set(current)
-            self.rd.calib.set(status)
-            self._result_basis = None
-            self.view()  # expected mode/session transition invalidates the old cached context
-            self.last_result = last
-        except BaseException as err:
-            self.job = {"kind": "coarse", "title": "安装方向验证未开始", "failed": True, "msg": str(err)}
-            # The existing persistent transaction owns recovery if entering succeeded.
-            if helper.imu_redo_state(root=self.root).get("active"):
-                self.last_result = None
-            elif self._sampling_basis(self.rd.bus.value) != basis:
-                self.last_result = None
-            raise
-        finally:
-            self._redo_busy = False
-        return await self._verify(args, by)
+            current_redo = helper.imu_redo_state(root=self.root)
+            if (generation != self._context_generation or calibration_context(current,source,current_redo) != context
+                    or getattr(getattr(self.rd,"hello",None),"at",None) != daemon_generation):
+                raise Refused("核验期间连接、来源或标定会话已改变，请重新采数；没有请求保存")
+            self._pending_verification = {"verification_id":token, "mount":mount, "source":source,
+                "context":context, "deadline":time.monotonic()+min(300,reply.get("expires_in_seconds",300)),
+                "daemon_generation":daemon_generation, "native_saved":False}
+        except (RpcError, Timeout, Unreachable, Refused) as e:
+            msg = str(e) if isinstance(e,Refused) else self._translate_verify_error(e)
+            self.job = {"kind":"coarse","title":"IMU 核验没通过","failed":True,"msg":msg}
+            self.log.warn("IMU 只读核验没通过："+msg,cat="IMU",raw=str(e),ctx={"by":by,"source":source})
+            raise Refused(msg) from e
+        self.job = {"kind":"coarse","title":"核验通过，尚未保存","done":True,
+                    "msg":"现在扶稳并失能（卸力），再点击「保存并结束校准」；核验结果五分钟内有效"}
+        return {"ok":True,"verified":True,"saved":False,"verification_id":token,
+                "note":"核验通过，尚未保存。现在扶稳并卸力，再保存并结束校准"}
+
+    async def _save_checked(self, args, by=None):
+        self.view()
+        pending = self._pending_verification
+        if (args.get("confirmed") is not True or not pending
+                or args.get("verification_id") != pending["verification_id"]):
+            raise Refused("没有当前会话的核验结果或已经过期：重新核验后再保存")
+        bus = await self._bus_once()
+        redo = self._coarse_guard(bus)
+        if bus.get("mode") != "commissioning" or bus.get("torque_state") != "off" or bus.get("hold"):
+            raise Refused("核验结果已保留：先扶稳并失能（卸力），确认全部卸力后再保存")
+        source, mount = pending["source"], pending["mount"]
+        if calibration_context(bus,source,redo) != pending["context"]:
+            raise Refused("核验后 IMU 来源或会话改变：请重新采数核验")
+        self.job = {"kind":"coarse","title":"正在保存并结束校准","msg":"确认卸力后保存，恢复原运行模式"}
+        try:
+            if not pending["native_saved"]:
+                result = await self._rpc_once("robot.busCommand", {"action":"save-checked-imu",
+                    "confirmed":True,"verification_id":pending["verification_id"]}, 8.0, "保存已核验的 IMU 方向")
+                if not isinstance(result,dict) or result.get("saved") is not True:
+                    raise Refused("主程序没有确认保存成功，未结束标定会话")
+                pending["native_saved"] = True
+            status = await self._verified_readback(source,mount,transport=pending["context"][1])
+            if redo.get("active"):
+                ok, code, detail = await asyncio.to_thread(helper.imu_recalibrate,by or "Studio","finish",
+                    session_id=redo["session_id"],source=source,quat=self._normalized_quat(mount))
+                if not ok:raise Refused(helper.friendly(code,detail,"imu-recalibrate"))
+                status = await self._verified_readback(source,mount,
+                    motion=redo.get("original_mode") != "commissioning",transport=pending["context"][1])
+            from .commit import clear_pending, load_pending, pending_matches
+            old = load_pending(self.state_dir)
+            info = bus_imu_of(bus)
+            if old and not pending_matches(old,source,{"imu_bus":info} if info else {}):clear_pending(self.state_dir)
+        except (RpcError, Timeout, Unreachable, Refused) as e:
+            msg = str(e) if isinstance(e,Refused) else str(e)
+            self.job = {"kind":"coarse","title":"保存或模式恢复未完成","failed":True,"msg":msg}
+            raise Refused(msg) from e
+        self._pending_verification = None
+        self.last_result = None
+        self.job = {"kind":"coarse","title":"安装方向校准完成","done":True,"msg":"已保存并确认读回，原运行模式已恢复"}
+        self.log.info("IMU 分阶段核验与保存完成",cat="IMU",ctx={"by":by,"source":source,"mount":mount})
+        return {"ok":True,"saved":True,"note":"安装方向已保存，原运行模式已恢复","calibration":status}
 
     @staticmethod
     def _normalized_quat(quat):
@@ -783,6 +766,10 @@ class ImuBackend:
         op = args.get("op")
         if self._verify_lock.locked():
             raise Refused("安装方向正在验证：等当前操作结束，紧急时仍可卸力")
+        if op in ("coarse-capture","solve","redo-start","redo-cancel","profile-select"):
+            if self._pending_verification and self._pending_verification.get("native_saved"):
+                raise Refused("安装方向已经保存，先完成模式恢复再开始新的采样")
+            self._pending_verification = None
         if (op in ("coarse-capture", "solve", "verify", "redo-start", "profile-select")
                 and self.job and not self.job.get("done") and not self.job.get("failed")):
             raise Refused("上一项采集或标定操作还没结束：等它完成再继续")
@@ -855,9 +842,9 @@ class ImuBackend:
                 self.job = {"kind": "coarse", "title": "粗校采数没完成", "failed": True,
                             "msg": str(err) or "采数已中止：重新采数或取消重做"}
                 raise
-        if op == "verify":
+        if op in ("verify", "save-verified"):
             async with self._verify_lock:
-                return await self._verify(args, by)
+                return await (self._verify(args, by) if op == "verify" else self._save_checked(args, by))
         if op in ("save", "coarse", "detect", "set_chip"):
             if op == "save":
                 raise Refused("新的 IMU 方向已经记下了：去「上手清单」第 3 步点「写进主程序」")
