@@ -81,6 +81,24 @@ class HomeCoarseTest(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(Refused):
                 asyncio.run(b.handle({'op':'coarse-capture','phase':'still','seconds':.5}))
 
+    def test_home_collection_accepts_dxl2_imu_without_age(self):
+        """SFLP 124/12（DXL2）数据块没有年龄：主程序报 None，按 imu_ready / fresh_sample 判新鲜（11-10 实机）；
+        会报年龄的协议缺了年龄照旧拒绝。"""
+        for protocol, board, ok in (('dxl2', 'sflp_124_12', True), ('feetech', 'ft6', False)):
+            b = self.home()
+            b.rd.bus.value['native'].update(imu_age_ms=None, imu_bus=fixtures.bus_transport(protocol, board))
+            b.rd.calib.value['calibration']['imu_bus_protocol'] = protocol
+            with self.subTest(protocol=protocol):
+                reason = b.view()['coarse_sampling']['reason']
+                if ok:
+                    self.assertIsNone(reason)
+                    still = asyncio.run(b.handle({'op': 'coarse-capture', 'phase': 'still', 'seconds': 3}))
+                    self.assertGreaterEqual(still['n'], 15)
+                else:
+                    self.assertEqual(reason, 'IMU 或关节读数不新鲜：等实时数据恢复再采数')
+                    with self.assertRaises(Refused):
+                        asyncio.run(b.handle({'op': 'coarse-capture', 'phase': 'still', 'seconds': .5}))
+
     def test_motion_stream_does_not_recount_a_frozen_sample(self):
         b = self.home()
         asyncio.run(b._bus_once())

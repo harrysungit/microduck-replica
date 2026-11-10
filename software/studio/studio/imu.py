@@ -236,6 +236,10 @@ class ImuBackend:
                 and bus.get("homed") is True and isinstance(error, (int, float)) and not isinstance(error, bool)
                 and math.isfinite(error) and 0 <= error <= 5)
         age = native.get("imu_age_ms")
+        # SFLP 124/12（DXL2）的数据块里没有「数据年龄」：主程序固定报 None（duck-control feetech.rs decode_dxl2），
+        # 它自己按「这次总线读取在时限内完成」判新鲜，结果就在 imu_ready / fresh_sample 里。这种 IMU 认主程序的判断；
+        # 会报年龄的协议照旧要 ≤250 ms（11-10 实机：DXL2 IMU 在 HOME 一直显示「读数不新鲜」，采不了数）
+        ageless = age is None and (bus_imu_of(bus) or {}).get("protocol") == "dxl2"
         reason = None
         if not available:
             reason = "当前不能在 HOME 原地采安装方向：先读取安装方向或进入初次标定模式"
@@ -249,8 +253,9 @@ class ImuBackend:
             reason = "先停下模型并保持 HOME：正在起身或策略接管时不能采数"
         elif not (held or off):
             reason = "先等 HOME 站稳（关节误差 ≤5°），或确认全部卸力"
-        elif (native.get("imu_ready") is not True or not isinstance(age, (int, float))
-              or isinstance(age, bool) or not math.isfinite(age) or not 0 <= age <= 250
+        elif (native.get("imu_ready") is not True
+              or (not ageless and (not isinstance(age, (int, float)) or isinstance(age, bool)
+                                   or not math.isfinite(age) or not 0 <= age <= 250))
               or bus.get("all_joints_fresh") is not True or bus.get("fresh_sample") is not True):
             reason = "IMU 或关节读数不新鲜：等实时数据恢复再采数"
         elif helper.flag_present():
