@@ -18,11 +18,11 @@ Studio 改的（用户要求和方案审查）：
   （参数文件，没有就 P5 · D0 · 限力 1000），写不进去不上力；见 MainGains、apply_gains；
 - 文件放在 Studio 的 state 目录（servo-calib/、servo-poses/）；模拟模式的校准备份放临时目录，不跟真舵机混。
 
-11-08 加的（零位微调、旷量；zero_* / play_*）：
+零位微调、读数晃动（zero_* / play_*）：
 - **零位微调**：上力保持时点动（只改目标 42，不写 EEPROM），对准了点「设为零位」：只换算偏移 31、目标跟着挪，
   关节不动；不关扭矩，所以没有中位校准那种下垂误差。一轮里改过的几颗记在同一份备份上，「撤销上一次」一次撤回整轮；
-- **旷量**：「读数晃动」= 上力时人轻推，编码器看得见的那部分；「总旷量」= 肢体推到两头各对准一次（记 A / B）的差；
-  「取中」把零位设在 A、B 中点；量的结果可以存成表；
+- **读数晃动**：上力保持时人轻推，记录位置读数的最大值与最小值之差，结果可以存成表；
+  读数受手推力度、保持刚度等影响，不作为总机械旷量，也不拆分舵机内外的间隙；
 - **偏移方向存盘**（servo-calib/offset-sign.json，按固件版本）：Studio 重启后改零位不用再探。
 """
 import json
@@ -41,12 +41,11 @@ CALIB_TOLERANCE = 2      # 校准后读数离目标多少步算到位
 DROOP_TOLERANCE = 3      # 关扭矩那几毫秒关节垂了多少步以内就不补偿
 OFFSET_LIMIT = 2047      # 偏移寄存器 31 的安全量程（|偏移| ≤ 2047 几种编码理解都一致，超出不写）
 CALIB_BIG_DEG = 30       # 摆好的位置离目标差这么多度以上：页面再确认一次，日志单独列出来（不拦）
-ZERO_JOG_MAX = 114       # 零位微调、量旷量时点动最多离 2048 多少步（10°）；差得更多就该松力重新摆、重新中位校准
+ZERO_JOG_MAX = 114       # 零位微调时点动最多离 2048 多少步（10°）；差得更多就该松力重新摆、重新中位校准
 ZERO_ROUND_MAX = 114     # 一轮零位微调里一颗最多改多少步（10°），理由同上
 ZERO_SET_SETTLE = 8      # 「设为零位」时读数离目标超过这么多步：还在走，或者手还推着，先不设
 SIGN_CHECK = 4           # 改零位写完偏移马上读一次：读数跟预期差这么多步以上就算没写对（偏移方向记反了会差 2 倍改动量）
 WIGGLE_S = 5.0           # 量「读数晃动」默认几秒
-PLAY_WARN_DEG = 2.0      # 旷量标黄：训练里带齿隙的任务按每个关节 ±1°（总间隙 2°）建模，超过的策略没见过
 SIGN_FILE = "offset-sign.json"
 FOLD_KNEE_SEND = 88 * math.pi / 180     # 发「折叠」时膝只折 88°：官方 90° 会让踝顶着大腿上的舵机
 JOINT = {20: "left_hip_yaw", 21: "left_hip_roll", 22: "left_hip_pitch", 23: "left_knee", 24: "left_ankle",
@@ -296,7 +295,7 @@ class ServoOps:
         self.manual = {}
         self._gains_logged = None
         self.zero_round = None           # 零位微调这一轮的备份文件名（_zero_round_file）
-        self.play = {}                   # 旷量：{id: {"a" / "b": {"pos": 读数, "off": 当时的偏移}, "wiggle": 步, "samples": 次, "at": 时间}}
+        self.play = {}                   # 读数晃动：{id: {"wiggle": 步, "samples": 次, "at": 时间}}
 
     # ---- 小工具 ----
 
@@ -1098,7 +1097,7 @@ class ServoOps:
                  "校准", "warn" if bad else "info")
         return {"ok": ok, "bad": {str(k): v for k, v in bad.items()}, "backup": fn}
 
-    # ---- 零位微调、旷量（11-08） ----
+    # ---- 零位微调、读数晃动 ----
 
     def _firmware(self, i):
         ver = self.bus.read(i, 0, 5)[1]
@@ -1153,7 +1152,7 @@ class ServoOps:
 
     def _need_hold(self, i):
         if self.bus.read_u8(i, 40) != 1:
-            raise Refused(f"#{i} 没在保持：先打开这颗的「保持」（零位微调、量旷量都要上着力做）")
+            raise Refused(f"#{i} 没在保持：先打开这颗的「保持」（零位微调、量读数晃动都要上着力做）")
 
     def _latest_backup(self):
         d = self.calib_dir()
@@ -1281,45 +1280,9 @@ class ServoOps:
         self._shift_zero(i, 2048 - back, "还原这颗")
         return self.zero_state(i)
 
-    def play_mark(self, i, end):
-        """量总旷量：肢体推到旷量一头、点动对准参考面，记 A；推到另一头再对准，记 B。
-        记读数和当时的偏移：中间改过零位也能换算到同一个坐标。"""
-        if end not in ("a", "b"):
-            raise Refused("只能记 A 或 B")
-        i = int(i)
-        self._need_hold(i)
-        p = self.play.setdefault(i, {})
-        p[end] = {"pos": self.read_pos(i), "off": self.read_off(i)}
-        p["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.log(f"#{i} 旷量：记 {end.upper()} = 读数 {p[end]['pos']}", "校准")
-        return self.zero_state(i)
-
-    def _mark_now(self, m, off_now):
-        """记下的读数换算到现在的零位：同一个物理位置，读数 = 当时读数 + 符号 × (现在偏移 − 当时偏移)。"""
-        if not m:
-            return None
-        if m["off"] == off_now:
-            return m["pos"]
-        if self.offset_sign is None:
-            return None
-        return m["pos"] + self.offset_sign * (off_now - m["off"])
-
-    def play_center(self, i):
-        """「取中」：零位设在 A、B 的中点（只换算偏移，不动关节；点「回零位」才走过去）。"""
-        i = int(i)
-        self._need_hold(i)
-        p = self.play.get(i) or {}
-        off = self.read_off(i)
-        a, b = self._mark_now(p.get("a"), off), self._mark_now(p.get("b"), off)
-        if a is None or b is None:
-            raise Refused(f"#{i} 先记 A 和 B（肢体推到旷量两头各对准一次）")
-        self._shift_zero(i, (a + b) / 2, "取中")
-        return self.zero_state(i)
-
     def play_wiggle(self, i, seconds=WIGGLE_S):
-        """量「读数晃动」：上力保持着，人轻推肢体来回，这边每 20 ms 读一次位置，记最大最小。编码器在输出侧
-        （fork 训练台：输出侧编码器反馈 = 电机角 + 齿隙角）：舵机里的齿隙读数看得见，舵盘、螺丝、打印件的旷量看不见，
-        总旷量减它 ≈ 舵机外面的旷量。P5 偏软，推得重读数也会跟着动，所以要轻推。"""
+        """上力保持时轻推肢体来回，每 20 ms 读一次位置，记录最大值与最小值之差。
+        结果受手推力度、舵机保持刚度等影响，仅供同条件比较，不代表总机械旷量。"""
         i = int(i)
         self._need_hold(i)
         seconds = max(1.0, min(10.0, float(seconds)))
@@ -1344,7 +1307,7 @@ class ServoOps:
         return self.zero_state(i)
 
     def zero_state(self, i=None):
-        """零位微调卡和旷量表要的：每颗这一轮改了多少、A / B（换算到现在的零位）、总旷量、读数晃动、舵机外面的旷量。"""
+        """零位微调和测量界面要的：每颗这一轮零位改了多少、读数晃动和测量时间。"""
         ids = [int(i)] if i not in (None, "") else list(IDS)
         path = os.path.join(self.calib_dir(), self.zero_round) if self.zero_round else None
         try:
@@ -1354,39 +1317,29 @@ class ServoOps:
         out = {}
         for j in ids:
             p = self.play.get(j) or {}
-            a = b = None
-            if p.get("a") or p.get("b"):
-                try:
-                    off = self.read_off(j)
-                    a, b = self._mark_now(p.get("a"), off), self._mark_now(p.get("b"), off)
-                except feetech.BusError:
-                    pass
-            total = None if a is None or b is None else abs(a - b)
-            wig = p.get("wiggle")
-            out[str(j)] = {"changed": deltas.get(str(j), 0), "a": a, "b": b, "total": total, "wiggle": wig,
-                           "outside": None if total is None or wig is None else max(0, total - wig), "at": p.get("at")}
+            out[str(j)] = {"changed": deltas.get(str(j), 0), "wiggle": p.get("wiggle"), "at": p.get("at")}
         return {"servos": out, "sign": self.offset_sign, "round": self.zero_round, "jog_max": ZERO_JOG_MAX,
-                "warn_deg": PLAY_WARN_DEG, "sim": self.s.sim}
+                "sim": self.s.sim}
 
     def play_save(self):
-        """旷量表落盘（state 目录 servo-play/play-时间.json；演示模式放临时目录），页面同时下载一份。"""
+        """读数晃动表落盘（state 目录 servo-play/play-时间.json；演示模式放临时目录），页面同时下载一份。"""
         rows = []
         for k, v in self.zero_state()["servos"].items():
-            if v["wiggle"] is None and v["total"] is None and not v["changed"]:
+            if v["wiggle"] is None:
                 continue
-            rows.append({"id": int(k), "joint": JOINT.get(int(k)), **v,
-                         **{f"{n}_deg": None if v[n] is None else round(v[n] * 360 / 4096, 2) for n in ("wiggle", "total", "outside")}})
+            rows.append({"id": int(k), "joint": JOINT.get(int(k)), "wiggle": v["wiggle"],
+                         "wiggle_deg": round(v["wiggle"] * 360 / 4096, 2), "at": v["at"]})
         if not rows:
-            raise Refused("还没量过：先选一颗，量读数晃动或者记 A / B")
+            raise Refused("还没量过：先选一颗，量读数晃动")
         d = os.path.join(self.calib_dir() if self.s.sim else self.state_dir, "servo-play")
         os.makedirs(d, exist_ok=True)
         fn = f"play-{time.strftime('%Y%m%d-%H%M%S')}.json"
-        out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "sim": self.s.sim, "warn_deg": PLAY_WARN_DEG,
-               "note": "步 = 舵机读数（一圈 4096 步）；changed = 这一轮零位改动（同一位置读数的变化），wiggle = 读数晃动，"
-                       "total = 总旷量（A、B 之差），outside = 总旷量 − 读数晃动",
+        out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "sim": self.s.sim,
+               "note": "步 = 舵机读数（一圈 4096 步）；wiggle = 测量期间位置读数的最大值 − 最小值，wiggle_deg 为角度。"
+                       "结果受手推力度、舵机保持刚度等影响，仅供同条件比较，不代表总机械旷量。",
                "servos": rows}
         _save_json(os.path.join(d, fn), out)
-        self.log(f"旷量表存了 {len(rows)} 颗：{d}{os.sep}{fn}", "校准")
+        self.log(f"读数晃动表存了 {len(rows)} 颗：{d}{os.sep}{fn}", "校准")
         return {"file": fn, **out}
 
     # ---- 姿态 ----
@@ -1632,10 +1585,6 @@ class ServoOps:
             return self.zero_set(args["id"])
         if op == "zero_revert":
             return self.zero_revert(args["id"])
-        if op == "play_mark":
-            return self.play_mark(args["id"], args.get("end"))
-        if op == "play_center":
-            return self.play_center(args["id"])
         if op == "play_wiggle":
             return self.play_wiggle(args["id"], args.get("seconds", WIGGLE_S))
         if op == "play_save":

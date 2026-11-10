@@ -5,8 +5,8 @@
 // - 右边：15 颗按左腿 / 右腿 / 头颈分三组，所有行同一套固定列宽、有表头，上下对齐；
 //   点一行才展开电压、负载、电流、偏移、P/D、方向 ±；
 // - 最下面折叠的「更多」：运动方式、存的姿态、高级工具（导出寄存器、改 ID……）、日志。
-// - 右边「零位微调 · 旷量」卡（11-08）：中位粗标以后上着力点动对准、「设为零位」（关节不动）；记 A / B 量旷量、取中；
-//   量读数晃动；量过的列成表，能存、能下载。
+// - 右边「零位微调 · 读数晃动」卡：中位粗标以后上着力点动对准、「设为零位」（关节不动）；
+//   保持时轻推来回量读数晃动；量过的列成表，能存、能下载。
 // 没接管总线时数据来自主程序，只能看；点「开始调舵机」才由 Studio 接管总线（主程序停、手柄不能用）。
 // 后端是 studio/servo_ops.py（照搬 servo-web 的 server.py）。
 import { html, Component, useState, useEffect, useRef, useCallback } from './vendor/preact-htm.module.js';
@@ -161,8 +161,8 @@ function Why() {
       <li>标好以后，机器读到 2048 就知道这个关节正好在零位。官方程序、训练出来的走路策略、Studio，<b>全部以 2048 为零</b>来算角度。</li>
       <li>没标好的话，策略以为腿是直的，实际弯了几度：走起来会歪、会蹭地、容易摔。</li>
       <li>机器自己不知道零件装成了什么样，只能由人照官方零位摆好，所以这一步要人来做。</li>
-      <li>手摆总有一两度误差：先「中位」粗标，再用「零位微调」上着力一步步推到对准（1 步 0.09°，不关扭矩、没有下垂误差）；
-        有旷量的关节用「记 A / 记 B / 取中」。</li>
+      <li>手摆总有一两度误差：先「中位」粗标，再用「零位微调」上着力一步步推到对准（1 步 0.09°，不关扭矩、没有下垂误差）。
+        想比较关节的晃动，可在保持时轻推，量「读数晃动」。</li>
     </ol>
   </section>`;
 }
@@ -328,17 +328,17 @@ function CalibCard({ open, op, selected, onSelect, rows, refreshZero }) {
   </section>`;
 }
 
-// ---------------- 零位微调、旷量（11-08） ----------------
+// ---------------- 零位微调、读数晃动 ----------------
 // 手摆总有一两度误差：「中位」粗标以后，上着力一步步点动到对准（只改目标，不写 EEPROM），点「设为零位」只换算偏移、
-// 关节不动（不关扭矩，没有下垂误差）。有旷量的关节：肢体推到两头各对准一次，记 A / B，「取中」零位设在中点。
-// 「读数晃动」= 上力时轻推、编码器看得见的那部分（舵机里的齿隙）；总旷量减它 ≈ 舵机外面的（舵盘、螺丝、打印件）。
+// 关节不动（不关扭矩，没有下垂误差）。
+// 「读数晃动」= 保持时轻推，位置读数的最大值 − 最小值；用于同条件比较，不拆分机械间隙。
 // 后端 servo_ops.zero_* / play_*；一轮改动记在一份备份上，「撤销上一次」一次撤回整轮。显示都按模型方向（跟「角度」列一样）。
 
 function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }) {
   const r = (rows || []).find((x) => x.id === selected);
   const z = (selected && zs?.servos?.[selected]) || {};
   const hold = !!(open && r && r.torque === 1);
-  const [busy, setBusy] = useState(null);          // 正在做的：'set' / 'revert' / 'a' / 'b' / 'center' / 'wiggle'
+  const [busy, setBusy] = useState(null);          // 正在做的：'set' / 'revert' / 'wiggle'
   const cur = useRef({});
   const last = useRef(0);
   cur.current = { r, hold };
@@ -374,7 +374,7 @@ function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }
 
   if (!r) {
     return html`<section class="board sv-card sv-trim">
-      <h3>零位微调 · 旷量</h3>
+      <h3>零位微调 · 读数晃动</h3>
       <div class="sv-ctrl"><${ServoPick} selected=${selected} onSelect=${onSelect} rows=${rows} />
         <span class="sv-small">先「中位」粗标，再选一颗在这里一步步推到对准（1 步 0.09°，键盘 ← →，Shift 一次 10 步）</span></div>
       <${PlayTable} rows=${rows} zs=${zs} op=${op} setHint=${setHint} />
@@ -382,10 +382,9 @@ function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }
   }
   const deg = (steps) => (steps == null ? '—' : sign(r.dir * steps * DEG, 2) + '°');
   const abs = (steps) => (steps == null ? '—' : fmt(steps * DEG, 2) + '°');
-  const warnCls = (steps) => (steps != null && steps * DEG > (zs?.warn_deg ?? 2) ? 'num sv-warn-b' : 'num');
   const moved = z.changed ? -z.changed : 0;         // 这一轮零位挪了多少（读数步）：同一个物理位置读数变化的相反数
   return html`<section class="board sv-card sv-trim">
-    <h3>零位微调 · 旷量</h3>
+    <h3>零位微调 · 读数晃动</h3>
     <div class="sv-form">
       <span class="sv-label">舵机</span>
       <div class="sv-ctrl"><${ServoPick} selected=${selected} onSelect=${onSelect} rows=${rows} />
@@ -412,29 +411,16 @@ function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }
         <button class="btn-light" disabled=${!hold || !!busy || !z.changed} onClick=${() => run('revert', { op: 'zero_revert', id: r.id })}
           title="这颗的零位改回这一轮开始前（关节不动）">还原这颗</button>
       </div>
-      <span class="sv-label">旷量</span>
-      <div class="sv-ctrl">
-        <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('a', { op: 'play_mark', id: r.id, end: 'a' })}
-          title="肢体推到旷量一头，点动对准参考面，再点这里">记 A</button>
-        <span class="sv-small num">${z.a == null ? 'A —' : 'A ' + deg(z.a - 2048)}</span>
-        <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('b', { op: 'play_mark', id: r.id, end: 'b' })}
-          title="肢体推到旷量另一头，点动对准参考面，再点这里">记 B</button>
-        <span class="sv-small num">${z.b == null ? 'B —' : 'B ' + deg(z.b - 2048)}</span>
-        <span class=${warnCls(z.total)}>总旷量 ${abs(z.total)}</span>
-        <button class="btn-light" disabled=${!hold || !!busy || z.total == null} onClick=${() => run('center', { op: 'play_center', id: r.id })}
-          title="零位设在 A、B 中点（关节不动；点「回零位」走过去看）">取中</button>
-      </div>
-      <span></span>
+      <span class="sv-label">读数晃动</span>
       <div class="sv-ctrl">
         <button class="btn-light" disabled=${!hold || !!busy} onClick=${() => run('wiggle', { op: 'play_wiggle', id: r.id, seconds: 5 }, 20000)}>
           ${busy === 'wiggle' ? '量着：轻推来回…' : '量读数晃动（5 秒）'}</button>
-        <span class=${warnCls(z.wiggle)}>读数晃动 ${abs(z.wiggle)}</span>
-        <span class="sv-small num">舵机外面 ≈ ${abs(z.outside)}</span>
+        <span class="num">读数晃动 ${abs(z.wiggle)}</span>
         ${zs?.sim ? html`<span class="sv-small">（演示：读数晃动是假数）</span>` : null}
       </div>
       <span></span>
-      <p class="sv-small">总旷量 = 肢体推到两头各对准一次的差；读数晃动 = 上着力轻推时编码器看得见的（舵机里的齿隙，推重了会多）；
-        相减 ≈ 舵盘、螺丝、打印件的。超过 ${zs?.warn_deg ?? 2}° 标黄：训练里按每个关节 ±1°（总 2°）的齿隙练的。零位改过以后，站姿 IMU 标定要重做。</p>
+      <p class="sv-small">保持开启后，点击测量并轻推肢体来回 5 秒。结果是这段时间位置读数的最大值 − 最小值，
+        受手推力度和舵机保持刚度影响，不代表总机械旷量。比较前后结果时，请保持姿态和推力尽量一致。</p>
     </div>
     <${PlayTable} rows=${rows} zs=${zs} op=${op} setHint=${setHint} />
   </section>`;
@@ -443,11 +429,8 @@ function TrimCard({ open, op, selected, onSelect, rows, zs, mergeZero, setHint }
 // 量过的列成一张表：存进 Studio 的 state（servo-play/），同时下载一份；也能复制成 Markdown
 function PlayTable({ rows, zs, op, setHint }) {
   const [saved, setSaved] = useState(null);
-  const warnDeg = zs?.warn_deg ?? 2;
-  const list = (rows || []).filter((r) => { const z = zs?.servos?.[r.id]; return z && (z.wiggle != null || z.total != null || z.changed); });
+  const list = (rows || []).filter((r) => zs?.servos?.[r.id]?.wiggle != null);
   const d = (steps) => (steps == null ? '—' : (steps * DEG).toFixed(2) + '°');
-  const cell = (steps) => html`<td class=${'r num' + (steps != null && steps * DEG > warnDeg ? ' warn' : '')}>${d(steps)}</td>`;
-  const zeroMoved = (r, z) => (z.changed ? sign(-r.dir * z.changed * DEG, 2) + '°' : '—');
   const save = async () => {
     const res = await op({ op: 'play_save' });
     if (!res.ok) return;
@@ -456,18 +439,16 @@ function PlayTable({ rows, zs, op, setHint }) {
     a.download = res.data.file; a.click();
     setSaved(res.data.file);
   };
-  const md = () => ['| 舵机 | 读数晃动 | 总旷量 | 舵机外面≈ | 这一轮零位 |', '|---|---|---|---|---|',
-    ...list.map((r) => { const z = zs.servos[r.id]; return `| ${r.id} ${r.cn} | ${d(z.wiggle)} | ${d(z.total)} | ${d(z.outside)} | ${zeroMoved(r, z)} |`; })].join('\n');
+  const md = () => ['| 舵机 | 读数晃动 |', '|---|---|',
+    ...list.map((r) => `| ${r.id} ${r.cn} | ${d(zs.servos[r.id].wiggle)} |`)].join('\n');
   return html`<details class="sv-playtab">
-    <summary>旷量表（量过 ${list.length} 颗）</summary>
-    ${list.length ? html`<table class="sv-plan"><thead><tr><th>舵机</th><th class="r">读数晃动</th><th class="r">总旷量</th>
-        <th class="r">舵机外面≈</th><th class="r">这一轮零位</th></tr></thead>
-      <tbody>${list.map((r) => { const z = zs.servos[r.id]; return html`<tr><td>${r.id} ${r.cn}</td>${cell(z.wiggle)}${cell(z.total)}${cell(z.outside)}
-        <td class="r num">${zeroMoved(r, z)}</td></tr>`; })}</tbody></table>
+    <summary>读数晃动表（量过 ${list.length} 颗）</summary>
+    ${list.length ? html`<table class="sv-plan"><thead><tr><th>舵机</th><th class="r">读数晃动</th></tr></thead>
+      <tbody>${list.map((r) => html`<tr><td>${r.id} ${r.cn}</td><td class="r num">${d(zs.servos[r.id].wiggle)}</td></tr>`)}</tbody></table>
       <div class="sv-ctrl"><button class="btn-light" onClick=${save}>存表并下载 JSON</button>
-        <button class="btn-light" onClick=${() => { navigator.clipboard?.writeText(md()); setHint('旷量表已复制成 Markdown'); }}>复制 Markdown 表</button>
+        <button class="btn-light" onClick=${() => { navigator.clipboard?.writeText(md()); setHint('读数晃动表已复制成 Markdown'); }}>复制 Markdown 表</button>
         ${saved ? html`<span class="sv-small">已存：${saved}（Studio 的 state/servo-play/ 里也有）</span>` : null}</div>`
-      : html`<p class="sv-small">还没量过：选一颗，量读数晃动或者记 A / B</p>`}
+      : html`<p class="sv-small">还没量过：选一颗，开启保持后量读数晃动</p>`}
   </details>`;
 }
 
@@ -643,7 +624,7 @@ export function ServoPage({ sv, link, leaveGuards }) {
   const [poses, setPoses] = useState([]);
   const [idle, setIdle] = useState(false);
   const [plan, setPlan] = useState(null);
-  const [zs, setZs] = useState(null);             // 零位微调、旷量（servo_ops.zero_state）
+  const [zs, setZs] = useState(null);             // 零位微调、读数晃动（servo_ops.zero_state）
   const [syncKey, setSyncKey] = useState(0);
   const open = sv?.state === 'open';
   // 滑块对齐当前位置：重建表格，所有滑块丢掉拖动中的值、回到实际读数（平时松手 0.6 秒也会自己回去）

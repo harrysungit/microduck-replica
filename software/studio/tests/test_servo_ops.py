@@ -1,9 +1,12 @@
 """舵机页的操作（servo_ops，照搬 servo-web）：用协议级模拟舵机跑一遍。"""
+import itertools
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -113,7 +116,7 @@ class ServoOpsTest(unittest.TestCase):
         with self.assertRaises(Refused):
             self.o.handle({"op": "nope"})
 
-    # ---- 零位微调、旷量（11-08） ----
+    # ---- 零位微调、读数晃动 ----
 
     def test_zero_jog_then_set_moves_the_zero_not_the_joint(self):
         """点动对准 →「设为零位」：只换算偏移，关节不动，这个位置读 2048；存的姿态跟着挪；
@@ -175,21 +178,15 @@ class ServoOpsTest(unittest.TestCase):
         with self.assertRaises(Refused):
             self.o.handle({"op": "zero_set", "id": 22})
 
-    def test_play_marks_and_center(self):
-        """总旷量：记 A / B，「取中」把零位设在中点、关节不动；A / B 换算到新零位以后正好对称。"""
+    def test_retired_play_operations_cannot_change_zero(self):
+        """旧页面再发记 A/B 或取中时拒绝操作，不能继续修改零位。"""
         self.o.handle({"op": "calibrate", "ids": "23"})
-        sv = self.sim(23)
-        for step in (10, 2):
-            self.o.handle({"op": "zero_jog", "id": 23, "step": step})
-        self.o.handle({"op": "play_mark", "id": 23, "end": "a"})          # 读数 2060
-        for _ in range(2):
-            self.o.handle({"op": "zero_jog", "id": 23, "step": -10})
-        self.o.handle({"op": "play_mark", "id": 23, "end": "b"})          # 读数 2040
-        st = self.o.handle({"op": "play_center", "id": 23})["servos"]["23"]
-        self.assertEqual(st["total"], 20)
-        self.assertEqual((st["a"], st["b"]), (2058, 2038))              # 中点 2050 → 2048
-        self.assertEqual(st["changed"], -2)
-        self.assertEqual(round(sv.pos()), 2038)                          # 关节没动：还停在 B 那头
+        before = bytes(self.sim(23).r)
+        for args in ({"op": "play_mark", "id": 23, "end": "a"},
+                     {"op": "play_mark", "id": 23, "end": "b"}, {"op": "play_center", "id": 23}):
+            with self.subTest(args=args), self.assertRaisesRegex(Refused, "不认识的指令"):
+                self.o.handle(args)
+        self.assertEqual(bytes(self.sim(23).r), before)
 
     def test_zero_ops_need_holding_and_stay_in_range(self):
         with self.assertRaises(Refused):
@@ -199,8 +196,6 @@ class ServoOpsTest(unittest.TestCase):
             self.o.handle({"op": "zero_jog", "id": 20, "step": 10})     # 离 2048 有 110 步
         with self.assertRaises(Refused):
             self.o.handle({"op": "zero_jog", "id": 20, "step": 10})     # 超过 114 步（10°）
-        with self.assertRaises(Refused):
-            self.o.handle({"op": "play_center", "id": 20})              # 还没记 A / B
         with self.assertRaises(Refused):
             self.o.handle({"op": "zero_revert", "id": 20})              # 这一轮没改过
 
@@ -219,13 +214,35 @@ class ServoOpsTest(unittest.TestCase):
         self.assertEqual(self.sim(22).off, off0[22] - 6)
 
     def test_wiggle_and_saved_table(self):
-        """读数晃动（演示模式给假数）和旷量表落盘。"""
+        """表格仅导出实际量过的舵机，零位微调不算测量，不再导出总量或内外间隙。"""
+        self.o.handle({"op": "calibrate", "ids": "20"})
+        self.o.handle({"op": "zero_jog", "id": 20, "step": 5})
+        self.o.handle({"op": "zero_set", "id": 20})
+        with self.assertRaisesRegex(Refused, "还没量过"):
+            self.o.handle({"op": "play_save"})
         self.o.handle({"op": "torque", "on": 1, "ids": [32]})
         st = self.o.handle({"op": "play_wiggle", "id": 32, "seconds": 1})["servos"]["32"]
         self.assertEqual(st["wiggle"], SIM_WIGGLE[32])
+        self.assertTrue({"a", "b", "total", "outside"}.isdisjoint(st))
         out = self.o.handle({"op": "play_save"})
         self.assertEqual([r["id"] for r in out["servos"]], [32])
-        self.assertTrue(os.path.isfile(os.path.join(self.o.calib_dir(), "servo-play", out["file"])))
+        self.assertEqual(out["servos"][0]["wiggle_deg"], round(SIM_WIGGLE[32] * 360 / 4096, 2))
+        self.assertTrue({"total", "outside", "total_deg", "outside_deg"}.isdisjoint(out["servos"][0]))
+        self.assertNotIn("warn_deg", out)
+        saved = Path(self.o.calib_dir()) / "servo-play" / out["file"]
+        self.assertEqual(json.loads(saved.read_text(encoding="utf-8")), {k: v for k, v in out.items() if k != "file"})
+
+    def test_wiggle_measures_reading_range_without_writing(self):
+        """实际测量分支记录读数范围，不改目标、偏移或保持状态；松开时不可测。"""
+        with self.assertRaisesRegex(Refused, "没在保持"):
+            self.o.handle({"op": "play_wiggle", "id": 32, "seconds": 1})
+        self.o.handle({"op": "torque", "on": 1, "ids": [32]})
+        self.s.sim = False
+        before = bytes(self.sim(32).r)
+        with patch.object(self.o, "read_pos", side_effect=itertools.cycle([2048, 2036, 2060, 2050])):
+            st = self.o.handle({"op": "play_wiggle", "id": 32, "seconds": 1})["servos"]["32"]
+        self.assertEqual(st["wiggle"], 24)
+        self.assertEqual(bytes(self.sim(32).r), before)
 
 
 if __name__ == "__main__":

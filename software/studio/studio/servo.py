@@ -54,7 +54,7 @@ HANDBACK_WAIT_S = 10.0        # 点「交还主程序」：同上（校准看到
 # 这几样在跑 = 「活还没干完」：离开舵机页不交还（第三批代码审查 D3a：一键校准跑着时离开，后面几颗被卸力锁打断）
 BUSY_OPS = {"calibrate": "正在校准", "undo": "正在撤销校准", "timing": "正在测总线时序", "scan_all": "正在扫全网",
             "scan": "正在扫描", "set_id": "正在改 ID", "reboot": "正在重启舵机", "write_reg": "正在写寄存器",
-            "zero_set": "正在改零位", "zero_revert": "正在改零位", "play_center": "正在改零位", "play_wiggle": "正在量旷量"}
+            "zero_set": "正在改零位", "zero_revert": "正在改零位", "play_wiggle": "正在量读数晃动"}
 
 
 class Refused(Exception):
