@@ -158,6 +158,10 @@ Qinmo 的一次性网页选择、受控重连和必须完成的安装方向验�
 电池用台架电源供电时，在「设置 → 电池」里把型号选成「台架电源」：只显示电压，不算电量、也不报电量。
 Studio 默认没有密码，同一网络里谁都能打开。在「设置 → 网页登录密码」里可以直接设置；设过以后要先登录才能改，也可以清掉。命令行 `python3 -I run.py set-password` 仍然可用，但要用 radxa 用户运行，别加 `sudo`（root 写的密码文件 Studio 读不了）。
 
+「总览 → 声音」提供鸭子扬声器音量滑块，0 为静音，松开后立即应用并保存到 state 目录的 `speaker-volume.json`。百分比按输出信号幅度映射到 AIC3104 的 0.5 dB 档位，25% 约为 −12 dB，10% 为 −20 dB；不等同于 ALSA 原始寄存器百分比。只调整 PCM 播放增益和 Line 播放静音，不修改麦克风。读取或保存失败时页面显示原因，不把未确认的值显示为已保存。
+
+安装开机恢复时，把 `deploy/aic3104-volume.conf` 放入 `/etc/systemd/system/aic3104-init.service.d/volume.conf` 并执行 `systemctl daemon-reload`。该配置在 ALSA 恢复和声卡初始化后、robotd 启动前应用保存值；Studio 启动时也会恢复。默认安装路径为 `/opt/microduck/software/current/studio`，状态目录为 `/var/lib/microduck-studio`；使用其他路径时需相应修改配置。
+
 ### 让电脑上的 AI 助手通过 SSH 连接
 
 总览仪表带下方、设置页顶部都有「让 AI 连接鸭子（SSH）」入口，点击后到 `#/settings/ssh` 并定位到三步指引。无需连接显示器；电脑需先能访问鸭子的网页／主板地址。

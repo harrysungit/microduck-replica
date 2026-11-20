@@ -47,6 +47,7 @@ from .state import summarize
 from .pad import Refused as PadRefused, robot_view  # 手柄页
 from .ai_connections import AiError
 from .ai_service import AiService
+from .speaker_volume import SpeakerVolume, VolumeError
 from .updates import Updates, UpdateError, handle as handle_updates, safe_during_update
 
 VERSION = "0.1.0-dev"
@@ -158,6 +159,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
               onboard=None, battery=None, tune=None, net=None, commit=None, ssh_home=None, models=None, sensors=None, updates=None):
     guard = OriginGuard(names=names)
     ai = AiService(state_dir)
+    speaker = SpeakerVolume(state_dir)
     updates = updates or Updates()
     if pad is not None:
         pad.update_guard=updates.installing
@@ -243,6 +245,33 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
             return JSONResponse({'ok':False,'code':error.code,'error':str(error)},status_code=error.status,headers={'Cache-Control':'no-store'})
         except Exception:
             return JSONResponse({'ok':False,'code':'service','error':'更新服务未完成请求，请稍后重试'},status_code=503,headers={'Cache-Control':'no-store'})
+
+    async def api_speaker_volume(request):
+        def response(data, status=200):
+            return JSONResponse(data, status_code=status, headers={'Cache-Control':'no-store'})
+        _, sess = session_of(request)
+        if not sess:
+            return response({'ok':False,'error':'请先登录'},401)
+        if request.method == 'POST' and (not origin_ok(request) or request.headers.get('x-csrf') != sess['csrf']):
+            return response({'ok':False,'error':'请求来源或登录令牌不正确'},403)
+        try:
+            if request.method == 'GET':
+                result = await asyncio.to_thread(speaker.view)
+            else:
+                raw = bytearray()
+                async for chunk in request.stream():
+                    raw.extend(chunk)
+                    if len(raw) > 128:
+                        return response({'ok':False,'error':'音量请求过大'},413)
+                body = json.loads(raw)
+                if not isinstance(body,dict) or set(body) != {'percent'}:
+                    raise ValueError('请提供音量百分比')
+                result = await asyncio.to_thread(speaker.set, body['percent'])
+            return response({'ok':True,**result})
+        except (ValueError, RecursionError) as e:
+            return response({'ok':False,'error':'音量必须为 0–100 的整数'},400)
+        except VolumeError as e:
+            return response({'ok':False,'error':str(e)},503)
 
     async def api_ai(request):
         def response(data, status=200):
@@ -1561,6 +1590,10 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
+        try:
+            await asyncio.to_thread(speaker.restore)
+        except VolumeError as e:
+            log.warn(str(e), cat='声音')
         await updates.start_readiness(update_readiness)
         watch = asyncio.create_task(servo_watch())
         feed = asyncio.create_task(pad_feed()) if pad is not None else None
@@ -1603,6 +1636,7 @@ def build_app(*, auth, robotd, log, web_dir, duck, names=(), state_dir=None, dev
         Route("/healthz", healthz),
         Route("/api/session", api_session),
         Route("/api/ai", api_ai, methods=["GET", "POST"]),
+        Route('/api/speaker-volume', api_speaker_volume, methods=['GET','POST']),
         Route('/api/updates',api_updates,methods=['GET','POST']),
         Route('/api/updates/upload',api_updates,methods=['POST']),
         Route("/api/login", api_login, methods=["POST"]),

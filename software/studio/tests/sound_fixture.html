@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="../web/styles.css"><title>声音设置测试</title>
+<body style="padding:20px"><main style="max-width:640px;margin:auto"><h1>设置</h1><div id="sound-test"></div></main>
+<script type="module">
+import {html,render} from '../web/vendor/preact-htm.module.js';
+import {SoundSettings} from '../web/settings-sound.js';
+window.soundState = {percent:10,muted:false,saved:false};
+window.soundWrites = [];
+window.soundFail = false;
+async function api(path,body) {
+  await new Promise(r => setTimeout(r,80));
+  if(window.soundFail) return {ok:false,error:'无法访问扬声器'};
+  if(body) {window.soundWrites.push(body.percent);window.soundState={percent:body.percent,muted:body.percent===0,saved:true};}
+  return {ok:true,...window.soundState};
+}
+render(html`<${SoundSettings} api=${api} />`, document.getElementById('sound-test'));
+</script></body></html>

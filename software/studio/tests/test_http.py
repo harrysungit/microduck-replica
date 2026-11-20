@@ -169,6 +169,44 @@ class HttpTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c2.accepted)
         c2.close()
 
+    async def test_speaker_volume_requires_session_and_csrf(self):
+        with unittest.mock.patch('studio.app.SpeakerVolume.view') as view, unittest.mock.patch('studio.app.SpeakerVolume.set') as save:
+            status, _, _ = await self.call('GET','/api/speaker-volume')
+            self.assertEqual(status,401)
+            token, _ = await self.login()
+            cookie = {'Cookie':f'{COOKIE}={token}'}
+            status, _, _ = await self.call('POST','/api/speaker-volume',{'percent':10},cookie)
+            self.assertEqual(status,403)
+            view.assert_not_called()
+            save.assert_not_called()
+
+    async def test_speaker_volume_roundtrip_and_validation(self):
+        token, _ = await self.login()
+        cookie = {'Cookie':f'{COOKIE}={token}'}
+        _, _, session = await self.call('GET','/api/session',headers=cookie)
+        headers = {**cookie,'Origin':self.origin,'X-CSRF':json.loads(session)['csrf']}
+        result = {'percent':10,'muted':False,'saved':True,'available':True}
+        with unittest.mock.patch('studio.app.SpeakerVolume.view',return_value=result), unittest.mock.patch('studio.app.SpeakerVolume.set',return_value=result) as save:
+            status, _, body = await self.call('GET','/api/speaker-volume',headers=cookie)
+            self.assertEqual(status,200)
+            self.assertEqual(json.loads(body)['percent'],10)
+            status, _, body = await self.call('POST','/api/speaker-volume',{'percent':10},headers)
+            self.assertEqual(status,200)
+            save.assert_called_once_with(10)
+            status, _, _ = await self.call('POST','/api/speaker-volume',{'percent':10,'command':'anything'},headers)
+            self.assertEqual(status,400)
+            status, _, _ = await self.call('POST','/api/speaker-volume',{'percent':'x'*200},headers)
+            self.assertEqual(status,413)
+            save.assert_called_once()
+
+    async def test_speaker_volume_hardware_error_is_visible(self):
+        from studio.speaker_volume import VolumeError
+        token, _ = await self.login()
+        with unittest.mock.patch('studio.app.SpeakerVolume.view',side_effect=VolumeError('无法访问扬声器')):
+            status, _, body = await self.call('GET','/api/speaker-volume',headers={'Cookie':f'{COOKIE}={token}'})
+            self.assertEqual(status,503)
+            self.assertFalse(json.loads(body)['ok'])
+
     async def test_bad_host_gets_421(self):
         st, _, _ = await self.call("GET", "/", headers={"Host": "evil.example.com"})
         self.assertEqual(st, 421)

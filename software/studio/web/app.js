@@ -11,6 +11,7 @@ import { ImuPage } from './imu.js';
 import { PadPage, padActivity, padGo } from './pad.js';
 import { BatteryCell } from './battery.js';
 import { BatterySettings } from './settings-battery.js';
+import { SoundSettings } from './settings-sound.js';
 import { AiSettings } from './settings-ai.js';
 import { UpdateSettings } from './settings-updates.js';
 import { AccessGuide, AiSshEntry } from './settings-access.js';
@@ -691,6 +692,7 @@ function Overview({ st, live, age, diagnosticElapsed, duck, pd, onSame, tune, se
     <${Stage} st=${st} live=${live} age=${age} name=${name} />
     <${Band} st=${st} pd=${pd} live=${live} diagnosticElapsed=${diagnosticElapsed} gray=${age > STALE_GRAY_MS} onSame=${onSame} sensorsActive=${sensorsActive} />
     <${AiSshEntry} />
+    <${SoundSettings} api=${api} />
     <${Onboard} st=${st} live=${live} />
     <${Todo} st=${st} live=${live} />
     <${PadPage} st=${st} pad=${pd} link=${link} api=${api} previewActive=${sensorsActive} live=${live} />
